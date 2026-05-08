@@ -1,0 +1,673 @@
+"""GitHub deployment plugins.
+
+Three concrete subclasses share a common base and differ only by host:
+
+* :class:`GitHubDeploymentPlugin` — github.com.
+* :class:`GitHubEnterpriseCloudDeploymentPlugin` — GHEC tenant on
+  ``*.ghe.com``.
+* :class:`GitHubEnterpriseServerDeploymentPlugin` — operator-managed GHES.
+
+Phase 1 implements ref / commit discovery, comparison, and workflow
+dispatch.  Tag and release creation arrive with the Promote tab in
+Phase 2.
+
+The plugin runs as the user via the paired ``IdentityPlugin``: callers
+materialize an :class:`~imbi_common.plugins.base.IdentityCredentials`
+and pass the access token through ``credentials['access_token']``.
+"""
+
+from __future__ import annotations
+
+import datetime
+import logging
+import typing
+import urllib.parse
+
+import httpx
+from imbi_common.plugins.base import (
+    Commit,
+    CompareResult,
+    CredentialField,
+    DeploymentPlugin,
+    DeploymentRun,
+    PluginContext,
+    PluginManifest,
+    PluginOption,
+    Ref,
+    RefInfo,
+    ReleaseInfo,
+)
+
+LOGGER = logging.getLogger(__name__)
+
+_DEFAULT_WORKFLOW = 'deploy.yml'
+_DEFAULT_DISPATCH_EVENT = 'imbi-deploy'
+_DEFAULT_ENVIRONMENT_INPUT = 'environment'
+_DEFAULT_REF_INPUT = 'ref'
+_HTTP_TIMEOUT_SECONDS = 10.0
+
+
+def _accept_header() -> dict[str, str]:
+    return {'Accept': 'application/vnd.github+json'}
+
+
+def _auth_headers(token: str) -> dict[str, str]:
+    return {
+        'Authorization': f'Bearer {token}',
+        **_accept_header(),
+    }
+
+
+def _short_sha(sha: str) -> str:
+    return sha[:7]
+
+
+def _parse_iso(value: str | None) -> datetime.datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _commit_from_payload(payload: dict[str, typing.Any]) -> Commit:
+    """Convert a GitHub commit list/object payload into a :class:`Commit`."""
+    sha = str(payload.get('sha', ''))
+    commit_meta: dict[str, typing.Any] = payload.get('commit') or {}
+    author_meta: dict[str, typing.Any] = commit_meta.get('author') or {}
+    raw_message = str(commit_meta.get('message') or '')
+    message_lines = raw_message.splitlines()
+    return Commit(
+        sha=sha,
+        short_sha=_short_sha(sha),
+        message=message_lines[0] if message_lines else '',
+        author=author_meta.get('name'),
+        authored_at=_parse_iso(author_meta.get('date')),
+        url=payload.get('html_url'),
+    )
+
+
+def _check_runs_to_status(
+    payload: dict[str, typing.Any],
+) -> typing.Literal['pass', 'fail', 'warn', 'unknown']:
+    """Roll up the GitHub /check-runs payload into a single status."""
+    raw_runs: list[dict[str, typing.Any]] = payload.get('check_runs') or []
+    if not raw_runs:
+        return 'unknown'
+    conclusions = {str(run.get('conclusion') or '') for run in raw_runs}
+    failed = {'failure', 'timed_out', 'action_required'}
+    if conclusions & failed:
+        return 'fail'
+    if 'cancelled' in conclusions or 'stale' in conclusions:
+        return 'warn'
+    if conclusions <= {'success', 'neutral', 'skipped', ''}:
+        if 'success' in conclusions:
+            return 'pass'
+        return 'unknown'
+    return 'unknown'
+
+
+class _DeploymentBase(DeploymentPlugin):
+    """Shared base for GitHub deployment plugins.
+
+    Subclasses set :attr:`manifest` and override :meth:`_resolve_host`.
+    Each plugin instance is single-shot: callers pass ``credentials``
+    (from the paired :class:`IdentityPlugin`) and ``ctx`` per call.
+    """
+
+    @classmethod
+    def _resolve_host(cls, options: dict[str, typing.Any]) -> str:
+        raise NotImplementedError
+
+    @staticmethod
+    def _normalize_host(raw: typing.Any, label: str) -> str:
+        host = str(raw or '').strip()
+        if not host:
+            raise ValueError(f'{label} requires the "host" option')
+        parsed = urllib.parse.urlsplit(
+            host if '://' in host else f'https://{host}'
+        )
+        if (
+            not parsed.hostname
+            or parsed.path not in ('', '/')
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError(f'{label} got invalid host value: {host!r}')
+        return parsed.hostname
+
+    def _api_base(self, options: dict[str, typing.Any]) -> str:
+        host = self._resolve_host(options)
+        if host == 'github.com':
+            return 'https://api.github.com'
+        if host.endswith('.ghe.com'):
+            return f'https://api.{host}'
+        return f'https://{host}/api/v3'
+
+    @staticmethod
+    def _owner_repo(options: dict[str, typing.Any]) -> tuple[str, str]:
+        owner = str(options.get('owner') or '').strip()
+        repo = str(options.get('repo') or '').strip()
+        if not owner or not repo:
+            raise ValueError(
+                'GitHub deployment plugin requires "owner" and "repo" '
+                'options on the project assignment'
+            )
+        return owner, repo
+
+    def _repo_url(self, options: dict[str, typing.Any]) -> str:
+        owner, repo = self._owner_repo(options)
+        return f'{self._api_base(options)}/repos/{owner}/{repo}'
+
+    @staticmethod
+    def _option_str(
+        options: dict[str, typing.Any], key: str, default: str
+    ) -> str:
+        value = options.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        return default
+
+    @staticmethod
+    def _token(credentials: dict[str, str]) -> str:
+        token = credentials.get('access_token') or credentials.get('token')
+        if not token:
+            raise ValueError(
+                'GitHub deployment plugin requires an OAuth access token; '
+                'expected ``credentials["access_token"]``'
+            )
+        return token
+
+    async def _client(
+        self, ctx: PluginContext, credentials: dict[str, str]
+    ) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            timeout=_HTTP_TIMEOUT_SECONDS,
+            headers=_auth_headers(self._token(credentials)),
+            base_url=self._repo_url(ctx.assignment_options),
+        )
+
+    # -- Refs ---------------------------------------------------------------
+
+    async def list_refs(
+        self,
+        ctx: PluginContext,
+        credentials: dict[str, str],
+        kind: typing.Literal['default', 'branch', 'tag', 'all'] = 'all',
+        query: str | None = None,
+    ) -> list[Ref]:
+        async with await self._client(ctx, credentials) as client:
+            results: list[Ref] = []
+            if kind in ('default', 'all'):
+                results.extend(await self._list_default_ref(client))
+            if kind in ('branch', 'all'):
+                results.extend(
+                    await self._list_branches(ctx, client, query=query)
+                )
+            if kind in ('tag', 'all'):
+                results.extend(await self._list_tags(client, query=query))
+            return results
+
+    async def _list_default_ref(self, client: httpx.AsyncClient) -> list[Ref]:
+        repo_resp = await client.get('')
+        repo_resp.raise_for_status()
+        repo_meta = typing.cast(dict[str, typing.Any], repo_resp.json())
+        default_branch = str(repo_meta.get('default_branch') or 'main')
+        branch_resp = await client.get(f'/branches/{default_branch}')
+        if branch_resp.status_code != 200:
+            return []
+        branch = typing.cast(dict[str, typing.Any], branch_resp.json())
+        branch_commit: dict[str, typing.Any] = branch.get('commit') or {}
+        sha = str(branch_commit.get('sha') or '')
+        return [
+            Ref(
+                name=default_branch,
+                kind='default',
+                sha=sha,
+                is_default=True,
+            )
+        ]
+
+    async def _list_branches(
+        self,
+        ctx: PluginContext,
+        client: httpx.AsyncClient,
+        query: str | None = None,
+    ) -> list[Ref]:
+        params: dict[str, str] = {'per_page': '100'}
+        resp = await client.get('/branches', params=params)
+        resp.raise_for_status()
+        rows = typing.cast(list[dict[str, typing.Any]], resp.json())
+        default_branch = str(
+            ctx.assignment_options.get('default_branch') or 'main'
+        )
+        out: list[Ref] = []
+        for row in rows:
+            name = str(row.get('name') or '')
+            if not name or name == default_branch:
+                continue
+            if query and query.lower() not in name.lower():
+                continue
+            commit: dict[str, typing.Any] = row.get('commit') or {}
+            sha = str(commit.get('sha') or '')
+            out.append(Ref(name=name, kind='branch', sha=sha))
+        return out
+
+    async def _list_tags(
+        self, client: httpx.AsyncClient, query: str | None = None
+    ) -> list[Ref]:
+        resp = await client.get('/tags', params={'per_page': '50'})
+        resp.raise_for_status()
+        rows = typing.cast(list[dict[str, typing.Any]], resp.json())
+        out: list[Ref] = []
+        for row in rows:
+            name = str(row.get('name') or '')
+            if not name:
+                continue
+            if query and query.lower() not in name.lower():
+                continue
+            commit: dict[str, typing.Any] = row.get('commit') or {}
+            sha = str(commit.get('sha') or '')
+            out.append(Ref(name=name, kind='tag', sha=sha))
+        return out
+
+    # -- Commits ------------------------------------------------------------
+
+    async def list_commits(
+        self,
+        ctx: PluginContext,
+        credentials: dict[str, str],
+        ref: str,
+        limit: int = 25,
+    ) -> list[Commit]:
+        params = {'sha': ref, 'per_page': str(max(1, min(limit, 100)))}
+        async with await self._client(ctx, credentials) as client:
+            resp = await client.get('/commits', params=params)
+            resp.raise_for_status()
+            rows = typing.cast(list[dict[str, typing.Any]], resp.json())
+            commits = [_commit_from_payload(row) for row in rows]
+            if commits:
+                commits[0] = commits[0].model_copy(update={'is_head': True})
+            for index, commit in enumerate(commits):
+                commits[index] = await self._hydrate_check_status(
+                    client, commit
+                )
+            return commits
+
+    async def _hydrate_check_status(
+        self, client: httpx.AsyncClient, commit: Commit
+    ) -> Commit:
+        try:
+            resp = await client.get(f'/commits/{commit.sha}/check-runs')
+        except httpx.HTTPError:
+            return commit
+        if resp.status_code != 200:
+            return commit
+        try:
+            payload = typing.cast(dict[str, typing.Any], resp.json())
+        except ValueError:
+            return commit
+        return commit.model_copy(
+            update={'ci_status': _check_runs_to_status(payload)}
+        )
+
+    async def resolve_committish(
+        self,
+        ctx: PluginContext,
+        credentials: dict[str, str],
+        committish: str,
+    ) -> Commit:
+        async with await self._client(ctx, credentials) as client:
+            resp = await client.get(
+                f'/commits/{urllib.parse.quote(committish, safe="")}'
+            )
+            resp.raise_for_status()
+            payload = typing.cast(dict[str, typing.Any], resp.json())
+            return _commit_from_payload(payload)
+
+    # -- Compare ------------------------------------------------------------
+
+    async def compare(
+        self,
+        ctx: PluginContext,
+        credentials: dict[str, str],
+        base: str,
+        head: str,
+    ) -> CompareResult:
+        async with await self._client(ctx, credentials) as client:
+            quoted = urllib.parse.quote(f'{base}...{head}', safe='.')
+            resp = await client.get(f'/compare/{quoted}')
+            resp.raise_for_status()
+            payload = typing.cast(dict[str, typing.Any], resp.json())
+            commits_raw: list[dict[str, typing.Any]] = (
+                payload.get('commits') or []
+            )
+            commits: list[Commit] = [
+                _commit_from_payload(item) for item in commits_raw
+            ]
+            files: list[dict[str, typing.Any]] = payload.get('files') or []
+            additions = sum(int(f.get('additions') or 0) for f in files)
+            deletions = sum(int(f.get('deletions') or 0) for f in files)
+            base_commit: dict[str, typing.Any] = (
+                payload.get('base_commit')
+                or payload.get('merge_base_commit')
+                or {}
+            )
+            base_sha = str(base_commit.get('sha') or base)
+            head_sha = commits[-1].sha if commits else head
+            return CompareResult(
+                base_sha=base_sha,
+                head_sha=head_sha,
+                ahead=int(payload.get('ahead_by') or 0),
+                behind=int(payload.get('behind_by') or 0),
+                commits=commits,
+                files_changed=len(files),
+                additions=additions,
+                deletions=deletions,
+            )
+
+    # -- Tags / Releases (Phase 2 — implemented here for completeness) -----
+
+    async def create_tag(
+        self,
+        ctx: PluginContext,
+        credentials: dict[str, str],
+        sha: str,
+        tag: str,
+        message: str,
+    ) -> RefInfo:
+        async with await self._client(ctx, credentials) as client:
+            tag_resp = await client.post(
+                '/git/tags',
+                json={
+                    'tag': tag,
+                    'message': message,
+                    'object': sha,
+                    'type': 'commit',
+                },
+            )
+            tag_resp.raise_for_status()
+            tag_payload = typing.cast(dict[str, typing.Any], tag_resp.json())
+            ref_resp = await client.post(
+                '/git/refs',
+                json={
+                    'ref': f'refs/tags/{tag}',
+                    'sha': str(tag_payload.get('sha') or sha),
+                },
+            )
+            ref_resp.raise_for_status()
+            ref_payload = typing.cast(dict[str, typing.Any], ref_resp.json())
+            return RefInfo(
+                name=str(ref_payload.get('ref') or f'refs/tags/{tag}'),
+                sha=str(ref_payload.get('object', {}).get('sha') or sha),
+                url=ref_payload.get('url'),
+            )
+
+    async def create_release(
+        self,
+        ctx: PluginContext,
+        credentials: dict[str, str],
+        tag: str,
+        name: str,
+        body_markdown: str,
+        prerelease: bool = False,
+    ) -> ReleaseInfo:
+        async with await self._client(ctx, credentials) as client:
+            resp = await client.post(
+                '/releases',
+                json={
+                    'tag_name': tag,
+                    'name': name,
+                    'body': body_markdown,
+                    'prerelease': prerelease,
+                },
+            )
+            resp.raise_for_status()
+            payload = typing.cast(dict[str, typing.Any], resp.json())
+            return ReleaseInfo(
+                id=str(payload.get('id') or ''),
+                tag=str(payload.get('tag_name') or tag),
+                name=payload.get('name'),
+                url=payload.get('url'),
+                html_url=payload.get('html_url'),
+                prerelease=bool(payload.get('prerelease', prerelease)),
+            )
+
+    # -- Workflow dispatch --------------------------------------------------
+
+    async def trigger_deployment(
+        self,
+        ctx: PluginContext,
+        credentials: dict[str, str],
+        ref_or_sha: str,
+        inputs: dict[str, str] | None = None,
+    ) -> DeploymentRun:
+        options = ctx.assignment_options
+        workflow = self._option_str(options, 'workflow', _DEFAULT_WORKFLOW)
+        env_input = self._option_str(
+            options, 'environment_input', _DEFAULT_ENVIRONMENT_INPUT
+        )
+        ref_input = self._option_str(options, 'ref_input', _DEFAULT_REF_INPUT)
+        if not ctx.environment:
+            raise ValueError(
+                'trigger_deployment requires PluginContext.environment'
+            )
+        body_inputs: dict[str, str] = {
+            env_input: ctx.environment,
+            ref_input: ref_or_sha,
+        }
+        if inputs:
+            body_inputs.update(inputs)
+        async with await self._client(ctx, credentials) as client:
+            dispatch_resp = await client.post(
+                f'/actions/workflows/{workflow}/dispatches',
+                json={'ref': ref_or_sha, 'inputs': body_inputs},
+            )
+            dispatch_resp.raise_for_status()
+            # GitHub returns 204 with no body — find the run we just
+            # created by listing recent runs filtered to this workflow.
+            runs_resp = await client.get(
+                f'/actions/workflows/{workflow}/runs',
+                params={'per_page': '5'},
+            )
+            run_id = ''
+            run_url: str | None = None
+            if runs_resp.status_code == 200:
+                payload = typing.cast(dict[str, typing.Any], runs_resp.json())
+                runs: list[dict[str, typing.Any]] = (
+                    payload.get('workflow_runs') or []
+                )
+                if runs:
+                    run_id = str(runs[0].get('id') or '')
+                    run_url = runs[0].get('html_url')
+            return DeploymentRun(
+                run_id=run_id,
+                run_url=run_url,
+                status='queued',
+            )
+
+    async def get_deployment_status(
+        self,
+        ctx: PluginContext,
+        credentials: dict[str, str],
+        run_id: str,
+    ) -> DeploymentRun:
+        async with await self._client(ctx, credentials) as client:
+            resp = await client.get(f'/actions/runs/{run_id}')
+            resp.raise_for_status()
+            payload = typing.cast(dict[str, typing.Any], resp.json())
+            status_raw = str(payload.get('status') or '')
+            conclusion = str(payload.get('conclusion') or '')
+            status: typing.Literal[
+                'queued',
+                'in_progress',
+                'success',
+                'failure',
+                'cancelled',
+                'unknown',
+            ]
+            if status_raw == 'queued':
+                status = 'queued'
+            elif status_raw == 'in_progress':
+                status = 'in_progress'
+            elif conclusion == 'success':
+                status = 'success'
+            elif conclusion in {'failure', 'timed_out', 'action_required'}:
+                status = 'failure'
+            elif conclusion == 'cancelled':
+                status = 'cancelled'
+            else:
+                status = 'unknown'
+            return DeploymentRun(
+                run_id=str(payload.get('id') or run_id),
+                run_url=payload.get('html_url'),
+                status=status,
+                started_at=_parse_iso(payload.get('run_started_at')),
+                completed_at=_parse_iso(payload.get('updated_at'))
+                if conclusion
+                else None,
+            )
+
+
+_COMMON_OPTIONS: list[PluginOption] = [
+    PluginOption(
+        name='owner',
+        label='Repository owner / organization',
+        type='string',
+        required=True,
+    ),
+    PluginOption(
+        name='repo',
+        label='Repository name',
+        type='string',
+        required=True,
+    ),
+    PluginOption(
+        name='default_branch',
+        label='Default branch',
+        type='string',
+        default='main',
+    ),
+    PluginOption(
+        name='workflow',
+        label='Workflow file',
+        description='File name in .github/workflows to dispatch.',
+        type='string',
+        default=_DEFAULT_WORKFLOW,
+    ),
+    PluginOption(
+        name='dispatch_event_type',
+        label='repository_dispatch event_type',
+        description=(
+            'Used when the workflow opts into ``repository_dispatch`` '
+            'instead of ``workflow_dispatch``.'
+        ),
+        type='string',
+        default=_DEFAULT_DISPATCH_EVENT,
+    ),
+    PluginOption(
+        name='environment_input',
+        label='Environment input name',
+        type='string',
+        default=_DEFAULT_ENVIRONMENT_INPUT,
+    ),
+    PluginOption(
+        name='ref_input',
+        label='Ref input name',
+        type='string',
+        default=_DEFAULT_REF_INPUT,
+    ),
+]
+
+_COMMON_CREDENTIALS: list[CredentialField] = [
+    CredentialField(
+        name='access_token',
+        label='Service-account PAT (optional fallback)',
+        description=(
+            'Personal access token used when no per-user identity is '
+            'bound.  Requires contents:write and actions:write scopes.'
+        ),
+        required=False,
+    ),
+]
+
+
+class GitHubDeploymentPlugin(_DeploymentBase):
+    manifest = PluginManifest(
+        slug='github-deployment',
+        name='GitHub Deployment',
+        description=(
+            'Drive github.com workflow_dispatch deployments and record '
+            'GitHub Releases on behalf of an Imbi project.'
+        ),
+        plugin_type='deployment',
+        options=_COMMON_OPTIONS,
+        credentials=_COMMON_CREDENTIALS,
+    )
+
+    @classmethod
+    def _resolve_host(cls, options: dict[str, typing.Any]) -> str:
+        return 'github.com'
+
+
+class GitHubEnterpriseCloudDeploymentPlugin(_DeploymentBase):
+    manifest = PluginManifest(
+        slug='github-deployment-ec',
+        name='GitHub Enterprise Cloud Deployment',
+        description=(
+            'Drive workflow_dispatch deployments against a GHEC tenant '
+            '(``*.ghe.com``).'
+        ),
+        plugin_type='deployment',
+        options=[
+            PluginOption(
+                name='host',
+                label='GHEC tenant host',
+                description='e.g. tenant.ghe.com',
+                type='string',
+                required=True,
+            ),
+            *_COMMON_OPTIONS,
+        ],
+        credentials=_COMMON_CREDENTIALS,
+    )
+
+    @classmethod
+    def _resolve_host(cls, options: dict[str, typing.Any]) -> str:
+        host = cls._normalize_host(options.get('host'), 'GHEC plugin')
+        if (
+            not host.endswith('.ghe.com')
+            or host == '.ghe.com'
+            or host.startswith('api.')
+        ):
+            raise ValueError(
+                'GHEC deployment plugin requires a tenant host like '
+                f'"tenant.ghe.com"; got {host!r}'
+            )
+        return host
+
+
+class GitHubEnterpriseServerDeploymentPlugin(_DeploymentBase):
+    manifest = PluginManifest(
+        slug='github-deployment-es',
+        name='GitHub Enterprise Server Deployment',
+        description=(
+            'Drive workflow_dispatch deployments against a GHES install.'
+        ),
+        plugin_type='deployment',
+        options=[
+            PluginOption(
+                name='host',
+                label='GHES host',
+                type='string',
+                required=True,
+            ),
+            *_COMMON_OPTIONS,
+        ],
+        credentials=_COMMON_CREDENTIALS,
+    )
+
+    @classmethod
+    def _resolve_host(cls, options: dict[str, typing.Any]) -> str:
+        return cls._normalize_host(options.get('host'), 'GHES plugin')
