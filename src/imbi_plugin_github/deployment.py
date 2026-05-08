@@ -18,6 +18,8 @@ and pass the access token through ``credentials['access_token']``.
 
 from __future__ import annotations
 
+import asyncio
+import collections.abc
 import datetime
 import logging
 import typing
@@ -37,6 +39,8 @@ from imbi_common.plugins.base import (
     RefInfo,
     ReleaseInfo,
 )
+
+from imbi_plugin_github._hosts import normalize_host, require_ghec_tenant_host
 
 LOGGER = logging.getLogger(__name__)
 
@@ -120,23 +124,6 @@ class _DeploymentBase(DeploymentPlugin):
     def _resolve_host(cls, options: dict[str, typing.Any]) -> str:
         raise NotImplementedError
 
-    @staticmethod
-    def _normalize_host(raw: typing.Any, label: str) -> str:
-        host = str(raw or '').strip()
-        if not host:
-            raise ValueError(f'{label} requires the "host" option')
-        parsed = urllib.parse.urlsplit(
-            host if '://' in host else f'https://{host}'
-        )
-        if (
-            not parsed.hostname
-            or parsed.path not in ('', '/')
-            or parsed.query
-            or parsed.fragment
-        ):
-            raise ValueError(f'{label} got invalid host value: {host!r}')
-        return parsed.hostname
-
     def _api_base(self, options: dict[str, typing.Any]) -> str:
         host = self._resolve_host(options)
         if host == 'github.com':
@@ -179,7 +166,7 @@ class _DeploymentBase(DeploymentPlugin):
             )
         return token
 
-    async def _client(
+    def _client(
         self, ctx: PluginContext, credentials: dict[str, str]
     ) -> httpx.AsyncClient:
         return httpx.AsyncClient(
@@ -197,17 +184,16 @@ class _DeploymentBase(DeploymentPlugin):
         kind: typing.Literal['default', 'branch', 'tag', 'all'] = 'all',
         query: str | None = None,
     ) -> list[Ref]:
-        async with await self._client(ctx, credentials) as client:
-            results: list[Ref] = []
+        async with self._client(ctx, credentials) as client:
+            tasks: list[collections.abc.Awaitable[list[Ref]]] = []
             if kind in ('default', 'all'):
-                results.extend(await self._list_default_ref(client))
+                tasks.append(self._list_default_ref(client))
             if kind in ('branch', 'all'):
-                results.extend(
-                    await self._list_branches(ctx, client, query=query)
-                )
+                tasks.append(self._list_branches(ctx, client, query=query))
             if kind in ('tag', 'all'):
-                results.extend(await self._list_tags(client, query=query))
-            return results
+                tasks.append(self._list_tags(client, query=query))
+            groups = await asyncio.gather(*tasks)
+            return [ref for group in groups for ref in group]
 
     async def _list_default_ref(self, client: httpx.AsyncClient) -> list[Ref]:
         repo_resp = await client.get('')
@@ -282,18 +268,18 @@ class _DeploymentBase(DeploymentPlugin):
         limit: int = 25,
     ) -> list[Commit]:
         params = {'sha': ref, 'per_page': str(max(1, min(limit, 100)))}
-        async with await self._client(ctx, credentials) as client:
+        async with self._client(ctx, credentials) as client:
             resp = await client.get('/commits', params=params)
             resp.raise_for_status()
             rows = typing.cast(list[dict[str, typing.Any]], resp.json())
             commits = [_commit_from_payload(row) for row in rows]
             if commits:
                 commits[0] = commits[0].model_copy(update={'is_head': True})
-            for index, commit in enumerate(commits):
-                commits[index] = await self._hydrate_check_status(
-                    client, commit
+            return list(
+                await asyncio.gather(
+                    *(self._hydrate_check_status(client, c) for c in commits)
                 )
-            return commits
+            )
 
     async def _hydrate_check_status(
         self, client: httpx.AsyncClient, commit: Commit
@@ -318,7 +304,7 @@ class _DeploymentBase(DeploymentPlugin):
         credentials: dict[str, str],
         committish: str,
     ) -> Commit:
-        async with await self._client(ctx, credentials) as client:
+        async with self._client(ctx, credentials) as client:
             resp = await client.get(
                 f'/commits/{urllib.parse.quote(committish, safe="")}'
             )
@@ -335,7 +321,7 @@ class _DeploymentBase(DeploymentPlugin):
         base: str,
         head: str,
     ) -> CompareResult:
-        async with await self._client(ctx, credentials) as client:
+        async with self._client(ctx, credentials) as client:
             quoted = urllib.parse.quote(f'{base}...{head}', safe='.')
             resp = await client.get(f'/compare/{quoted}')
             resp.raise_for_status()
@@ -377,7 +363,7 @@ class _DeploymentBase(DeploymentPlugin):
         tag: str,
         message: str,
     ) -> RefInfo:
-        async with await self._client(ctx, credentials) as client:
+        async with self._client(ctx, credentials) as client:
             tag_resp = await client.post(
                 '/git/tags',
                 json={
@@ -413,7 +399,7 @@ class _DeploymentBase(DeploymentPlugin):
         body_markdown: str,
         prerelease: bool = False,
     ) -> ReleaseInfo:
-        async with await self._client(ctx, credentials) as client:
+        async with self._client(ctx, credentials) as client:
             resp = await client.post(
                 '/releases',
                 json={
@@ -459,7 +445,7 @@ class _DeploymentBase(DeploymentPlugin):
         }
         if inputs:
             body_inputs.update(inputs)
-        async with await self._client(ctx, credentials) as client:
+        async with self._client(ctx, credentials) as client:
             dispatch_resp = await client.post(
                 f'/actions/workflows/{workflow}/dispatches',
                 json={'ref': ref_or_sha, 'inputs': body_inputs},
@@ -493,7 +479,7 @@ class _DeploymentBase(DeploymentPlugin):
         credentials: dict[str, str],
         run_id: str,
     ) -> DeploymentRun:
-        async with await self._client(ctx, credentials) as client:
+        async with self._client(ctx, credentials) as client:
             resp = await client.get(f'/actions/runs/{run_id}')
             resp.raise_for_status()
             payload = typing.cast(dict[str, typing.Any], resp.json())
@@ -635,17 +621,10 @@ class GitHubEnterpriseCloudDeploymentPlugin(_DeploymentBase):
 
     @classmethod
     def _resolve_host(cls, options: dict[str, typing.Any]) -> str:
-        host = cls._normalize_host(options.get('host'), 'GHEC plugin')
-        if (
-            not host.endswith('.ghe.com')
-            or host == '.ghe.com'
-            or host.startswith('api.')
-        ):
-            raise ValueError(
-                'GHEC deployment plugin requires a tenant host like '
-                f'"tenant.ghe.com"; got {host!r}'
-            )
-        return host
+        return require_ghec_tenant_host(
+            normalize_host(options.get('host'), 'GHEC deployment plugin'),
+            'GHEC deployment plugin',
+        )
 
 
 class GitHubEnterpriseServerDeploymentPlugin(_DeploymentBase):
@@ -670,4 +649,4 @@ class GitHubEnterpriseServerDeploymentPlugin(_DeploymentBase):
 
     @classmethod
     def _resolve_host(cls, options: dict[str, typing.Any]) -> str:
-        return cls._normalize_host(options.get('host'), 'GHES plugin')
+        return normalize_host(options.get('host'), 'GHES deployment plugin')
