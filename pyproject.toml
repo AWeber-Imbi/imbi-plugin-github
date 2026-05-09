@@ -16,7 +16,7 @@ classifiers = [
 ]
 dependencies = [
   "httpx>=0.27",
-  "imbi-common>=0.3.0",
+  "imbi-common>=0.8.2",
   "pydantic>=2",
 ]
 
@@ -118,6 +118,12 @@ max-complexity = 15
 
 [tool.uv]
 default-groups = ["dev"]
+
+# Temporarily pin imbi-common to the feature branch that adds
+# ``CheckStatus`` + ``DeploymentPlugin.get_check_status``.  Reset to the
+# released ``>=0.8.2`` once imbi-common merges & publishes.
+[tool.uv.sources]
+imbi-common = { git = "https://github.com/AWeber-Imbi/imbi-common.git", rev = "feature/release-train-ci-status" }
 
 [[tool.uv.index]]
 url = "https://pypi.org/simple"
