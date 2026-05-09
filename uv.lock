@@ -645,7 +645,7 @@ wheels = [
 [[package]]
 name = "imbi-common"
 version = "0.8.2"
-source = { git = "https://github.com/AWeber-Imbi/imbi-common.git?rev=feature%2Foidc-refresh-resilience#f1370d51231e9facc7825c1c478d6c0916f8b1c6" }
+source = { git = "https://github.com/AWeber-Imbi/imbi-common.git?rev=main#a3475e2bac6bdc234f2a250d6393d0e9b5c9a032" }
 dependencies = [
   { name = "cryptography" },
   { name = "jsonschema-models" },
@@ -702,7 +702,7 @@ dist = [
 [package.metadata]
 requires-dist = [
   { name = "httpx", specifier = ">=0.27" },
-  { name = "imbi-common", git = "https://github.com/AWeber-Imbi/imbi-common.git?rev=feature%2Foidc-refresh-resilience" },
+  { name = "imbi-common", git = "https://github.com/AWeber-Imbi/imbi-common.git?rev=main" },
   { name = "pydantic", specifier = ">=2" },
 ]
 
@@ -710,7 +710,7 @@ requires-dist = [
 dev = [
   { name = "basedpyright" },
   { name = "coverage", extras = ["toml"] },
-  { name = "imbi-common", extras = ["server", "databases"], git = "https://github.com/AWeber-Imbi/imbi-common.git?rev=feature%2Foidc-refresh-resilience" },
+  { name = "imbi-common", extras = ["server", "databases"], git = "https://github.com/AWeber-Imbi/imbi-common.git?rev=main" },
   { name = "pre-commit" },
   { name = "pytest" },
   { name = "pytest-asyncio" },
