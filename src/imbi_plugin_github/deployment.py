@@ -48,6 +48,10 @@ _DEFAULT_WORKFLOW = 'deploy.yml'
 _DEFAULT_ENVIRONMENT_INPUT = 'environment'
 _DEFAULT_REF_INPUT = 'ref'
 _HTTP_TIMEOUT_SECONDS = 10.0
+# Cap pagination so a pathological repo (10k+ branches/tags) can't pin
+# us indefinitely.  100 per page * 10 pages = 1000 refs is plenty for
+# the deployment-plugin UI's purposes.
+_MAX_REF_PAGES = 10
 
 
 def _accept_header() -> dict[str, str]:
@@ -63,6 +67,36 @@ def _auth_headers(token: str) -> dict[str, str]:
 
 def _short_sha(sha: str) -> str:
     return sha[:7]
+
+
+def _next_page_url(link_header: str | None) -> str | None:
+    """Extract the ``rel="next"`` URL from a GitHub ``Link`` header.
+
+    Returns ``None`` when no next page is advertised.
+    """
+    if not link_header:
+        return None
+    for part in link_header.split(','):
+        section = part.strip()
+        if not section.startswith('<'):
+            continue
+        end = section.find('>')
+        if end == -1:
+            continue
+        url = section[1:end]
+        params = section[end + 1 :]
+        if 'rel="next"' in params:
+            return url
+    return None
+
+
+def _query_param(url: str, name: str) -> str | None:
+    """Return the first value of ``name`` in ``url``'s query string."""
+    qs = urllib.parse.urlsplit(url).query
+    values = urllib.parse.parse_qs(qs).get(name)
+    if not values:
+        return None
+    return values[0]
 
 
 def _parse_iso(value: str | None) -> datetime.datetime | None:
@@ -97,6 +131,11 @@ def _check_runs_to_status(
     """Roll up the GitHub /check-runs payload into a single status."""
     raw_runs: list[dict[str, typing.Any]] = payload.get('check_runs') or []
     if not raw_runs:
+        return 'unknown'
+    # Don't roll up while any run is still in flight — a mix of one
+    # ``success`` and one ``in_progress`` would otherwise surface as
+    # ``pass`` because the in-progress conclusion is ``None``.
+    if any(str(run.get('status') or '') != 'completed' for run in raw_runs):
         return 'unknown'
     conclusions = {str(run.get('conclusion') or '') for run in raw_runs}
     failed = {'failure', 'timed_out', 'action_required'}
@@ -229,16 +268,43 @@ class _DeploymentBase(DeploymentPlugin):
             )
         ]
 
+    async def _paginate(
+        self,
+        client: httpx.AsyncClient,
+        path: str,
+        params: dict[str, str],
+    ) -> list[dict[str, typing.Any]]:
+        """Walk GitHub's ``Link: rel="next"`` pagination chain.
+
+        Caps at ``_MAX_REF_PAGES`` so a pathological repo can't pin us
+        on a single endpoint indefinitely.
+        """
+        all_rows: list[dict[str, typing.Any]] = []
+        page_params: dict[str, str] = dict(params)
+        for _ in range(_MAX_REF_PAGES):
+            resp = await client.get(path, params=page_params)
+            resp.raise_for_status()
+            rows = typing.cast(list[dict[str, typing.Any]], resp.json())
+            all_rows.extend(rows)
+            next_url = _next_page_url(resp.headers.get('link'))
+            if next_url is None:
+                break
+            # Pull the ``page`` cursor out of the Link header rather
+            # than re-issuing against the absolute URL — keeps us on
+            # the existing client base_url and respx-matchable.
+            next_page = _query_param(next_url, 'page')
+            if next_page is None:
+                break
+            page_params['page'] = next_page
+        return all_rows
+
     async def _list_branches(
         self,
         client: httpx.AsyncClient,
         default_branch: str,
         query: str | None = None,
     ) -> list[Ref]:
-        params: dict[str, str] = {'per_page': '100'}
-        resp = await client.get('/branches', params=params)
-        resp.raise_for_status()
-        rows = typing.cast(list[dict[str, typing.Any]], resp.json())
+        rows = await self._paginate(client, '/branches', {'per_page': '100'})
         out: list[Ref] = []
         for row in rows:
             name = str(row.get('name') or '')
@@ -254,9 +320,7 @@ class _DeploymentBase(DeploymentPlugin):
     async def _list_tags(
         self, client: httpx.AsyncClient, query: str | None = None
     ) -> list[Ref]:
-        resp = await client.get('/tags', params={'per_page': '50'})
-        resp.raise_for_status()
-        rows = typing.cast(list[dict[str, typing.Any]], resp.json())
+        rows = await self._paginate(client, '/tags', {'per_page': '100'})
         out: list[Ref] = []
         for row in rows:
             name = str(row.get('name') or '')
@@ -450,12 +514,12 @@ class _DeploymentBase(DeploymentPlugin):
             raise ValueError(
                 'trigger_deployment requires PluginContext.environment'
             )
-        body_inputs: dict[str, str] = {
-            env_input: ctx.environment,
-            ref_input: ref_or_sha,
-        }
-        if inputs:
-            body_inputs.update(inputs)
+        # Caller-supplied inputs come first; the reserved env/ref keys
+        # are written last so the plugin's contract (deploy *this* ref
+        # to *this* environment) can't be subverted by a stray entry.
+        body_inputs: dict[str, str] = dict(inputs or {})
+        body_inputs[env_input] = ctx.environment
+        body_inputs[ref_input] = ref_or_sha
         # Capture the dispatch instant *before* POSTing so we can
         # correlate the resulting workflow run on the listing endpoint.
         # GitHub records ``created_at`` with second precision, so subtract
@@ -504,11 +568,12 @@ class _DeploymentBase(DeploymentPlugin):
     ) -> dict[str, typing.Any] | None:
         """Pick the run created by the dispatch we just issued.
 
-        Filters to runs created at or after ``dispatch_started`` and,
-        when the supplied ref names a branch, to runs whose
-        ``head_branch`` matches.  Returns ``None`` when no run is an
-        unambiguous match — the caller surfaces an empty ``run_id``
-        rather than binding to someone else's run.
+        Only runs whose ``head_branch`` or ``head_sha`` explicitly
+        match ``ref_or_sha`` and whose ``created_at`` is at or after
+        ``dispatch_started`` are eligible.  Returns ``None`` when the
+        result is ambiguous (zero or multiple matches) — the caller
+        surfaces an empty ``run_id`` rather than binding to someone
+        else's run.
         """
         candidates: list[dict[str, typing.Any]] = []
         for run in runs:
@@ -518,12 +583,6 @@ class _DeploymentBase(DeploymentPlugin):
             head_branch = run.get('head_branch')
             head_sha = run.get('head_sha')
             if head_branch == ref_or_sha or head_sha == ref_or_sha:
-                candidates.append(run)
-                continue
-            # When the ref doesn't match either field, only accept
-            # the run if there are no other candidates — otherwise
-            # we cannot tell ours from a concurrent dispatch.
-            if head_branch is None and head_sha is None:
                 candidates.append(run)
         if len(candidates) == 1:
             return candidates[0]

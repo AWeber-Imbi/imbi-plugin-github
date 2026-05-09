@@ -1,6 +1,7 @@
 """Smoke tests for the GitHub deployment plugins."""
 
 import datetime
+import json
 import unittest
 
 import httpx
@@ -225,8 +226,8 @@ class CommitsTestCase(unittest.IsolatedAsyncioTestCase):
                 200,
                 json={
                     'check_runs': [
-                        {'conclusion': 'success'},
-                        {'conclusion': 'success'},
+                        {'status': 'completed', 'conclusion': 'success'},
+                        {'status': 'completed', 'conclusion': 'success'},
                     ]
                 },
             )
@@ -260,12 +261,58 @@ class CommitsTestCase(unittest.IsolatedAsyncioTestCase):
             'https://api.github.com/repos/octo/demo/commits/abc/check-runs'
         ).mock(
             return_value=httpx.Response(
-                200, json={'check_runs': [{'conclusion': 'failure'}]}
+                200,
+                json={
+                    'check_runs': [
+                        {'status': 'completed', 'conclusion': 'failure'}
+                    ]
+                },
             )
         )
         plugin = GitHubDeploymentPlugin()
         commits = await plugin.list_commits(_ctx(), _CREDS, ref='main')
         self.assertEqual(commits[0].ci_status, 'fail')
+
+    @respx.mock
+    async def test_list_commits_check_runs_in_progress_is_unknown(
+        self,
+    ) -> None:
+        # A mix of completed-success and still-running runs must not
+        # be reported as ``pass`` — the commit hasn't actually passed
+        # CI yet.
+        respx.get('https://api.github.com/repos/octo/demo/commits').mock(
+            return_value=httpx.Response(
+                200,
+                json=[
+                    {
+                        'sha': 'abc',
+                        'commit': {
+                            'message': 'msg',
+                            'author': {'name': 'X', 'date': None},
+                        },
+                    },
+                ],
+            )
+        )
+        respx.get(
+            'https://api.github.com/repos/octo/demo/commits/abc/check-runs'
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    'check_runs': [
+                        {
+                            'status': 'completed',
+                            'conclusion': 'success',
+                        },
+                        {'status': 'in_progress', 'conclusion': None},
+                    ]
+                },
+            )
+        )
+        plugin = GitHubDeploymentPlugin()
+        commits = await plugin.list_commits(_ctx(), _CREDS, ref='main')
+        self.assertEqual(commits[0].ci_status, 'unknown')
 
     @respx.mock
     async def test_list_commits_check_runs_404_falls_back_unknown(
@@ -522,6 +569,109 @@ class TriggerDeploymentTestCase(unittest.IsolatedAsyncioTestCase):
             ref_or_sha='main',
         )
         self.assertEqual(run.run_id, '')
+
+    @respx.mock
+    async def test_trigger_inputs_cannot_override_env_or_ref(self) -> None:
+        # Even if the caller supplies the reserved keys (or aliases of
+        # them), ``ctx.environment`` and ``ref_or_sha`` must win.
+        dispatch = respx.post(
+            'https://api.github.com/repos/octo/demo/actions/workflows/'
+            'deploy.yml/dispatches'
+        ).mock(return_value=httpx.Response(204))
+        respx.get(
+            'https://api.github.com/repos/octo/demo/actions/workflows/'
+            'deploy.yml/runs'
+        ).mock(return_value=httpx.Response(200, json={'workflow_runs': []}))
+        plugin = GitHubDeploymentPlugin()
+        await plugin.trigger_deployment(
+            _ctx(environment='production'),
+            _CREDS,
+            ref_or_sha='v1.2.3',
+            inputs={
+                'environment': 'staging',  # caller try to switch env
+                'ref': 'feature/sneaky',  # caller try to switch ref
+                'extra': 'kept',  # unrelated input is preserved
+            },
+        )
+        body = dispatch.calls.last.request.read().decode()
+        self.assertIn('"environment":"production"', body)
+        self.assertNotIn('"environment":"staging"', body)
+        # The ref input field — outer "ref" is the dispatch ref, not
+        # the input.  Verify within the ``inputs`` object.
+        self.assertIn('"extra":"kept"', body)
+        # ``inputs.ref`` must point at the deploy ref, not the
+        # caller-supplied override.
+        payload = json.loads(body)
+        self.assertEqual(payload['inputs']['ref'], 'v1.2.3')
+        self.assertEqual(payload['inputs']['environment'], 'production')
+        self.assertEqual(payload['inputs']['extra'], 'kept')
+
+
+class ListRefsPaginationTestCase(unittest.IsolatedAsyncioTestCase):
+    @respx.mock
+    async def test_list_branches_follows_next_link(self) -> None:
+        respx.get('https://api.github.com/repos/octo/demo/').mock(
+            return_value=httpx.Response(200, json={'default_branch': 'main'})
+        )
+        branches_url = 'https://api.github.com/repos/octo/demo/branches'
+        page2_link = f'{branches_url}?per_page=100&page=2'
+        # Register the more-specific (page=2) matcher first; respx
+        # matches first-registered-first and a subset matcher would
+        # otherwise swallow the page=2 request.
+        respx.get(branches_url, params={'per_page': '100', 'page': '2'}).mock(
+            return_value=httpx.Response(
+                200,
+                json=[
+                    {'name': 'feat-c', 'commit': {'sha': 'c'}},
+                ],
+            )
+        )
+        respx.get(branches_url, params={'per_page': '100'}).mock(
+            return_value=httpx.Response(
+                200,
+                json=[
+                    {'name': 'feat-a', 'commit': {'sha': 'a'}},
+                    {'name': 'feat-b', 'commit': {'sha': 'b'}},
+                ],
+                headers={'Link': f'<{page2_link}>; rel="next"'},
+            )
+        )
+        plugin = GitHubDeploymentPlugin()
+        refs = await plugin.list_refs(_ctx(), _CREDS, kind='branch')
+        names = sorted(r.name for r in refs)
+        self.assertEqual(names, ['feat-a', 'feat-b', 'feat-c'])
+
+    @respx.mock
+    async def test_list_tags_follows_next_link(self) -> None:
+        tags_url = 'https://api.github.com/repos/octo/demo/tags'
+        page2_link = f'{tags_url}?per_page=100&page=2'
+        respx.get(tags_url, params={'per_page': '100', 'page': '2'}).mock(
+            return_value=httpx.Response(
+                200,
+                json=[
+                    {'name': 'v2.0.0', 'commit': {'sha': 'c'}},
+                ],
+            )
+        )
+        respx.get(tags_url, params={'per_page': '100'}).mock(
+            return_value=httpx.Response(
+                200,
+                json=[
+                    {'name': 'v1.0.0', 'commit': {'sha': 'a'}},
+                    {'name': 'v1.1.0', 'commit': {'sha': 'b'}},
+                ],
+                headers={
+                    'Link': (
+                        f'<{page2_link}>; rel="next", '
+                        f'<{page2_link}>; rel="last"'
+                    )
+                },
+            )
+        )
+        plugin = GitHubDeploymentPlugin()
+        refs = await plugin.list_refs(_ctx(), _CREDS, kind='tag')
+        names = sorted(r.name for r in refs)
+        self.assertEqual(names, ['v1.0.0', 'v1.1.0', 'v2.0.0'])
 
 
 class GetDeploymentStatusTestCase(unittest.IsolatedAsyncioTestCase):
