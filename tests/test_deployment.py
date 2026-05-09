@@ -1,5 +1,6 @@
 """Smoke tests for the GitHub deployment plugins."""
 
+import datetime
 import unittest
 
 import httpx
@@ -117,6 +118,9 @@ class ListRefsTestCase(unittest.IsolatedAsyncioTestCase):
 
     @respx.mock
     async def test_list_refs_branches_skips_default(self) -> None:
+        respx.get('https://api.github.com/repos/octo/demo/').mock(
+            return_value=httpx.Response(200, json={'default_branch': 'main'})
+        )
         respx.get('https://api.github.com/repos/octo/demo/branches').mock(
             return_value=httpx.Response(
                 200,
@@ -134,7 +138,33 @@ class ListRefsTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(refs), 2)
 
     @respx.mock
+    async def test_list_refs_branch_uses_actual_default(self) -> None:
+        # Repo's real default is 'master'; assignment_options says 'main'.
+        # The branch list must hide 'master' (the real default) and keep
+        # 'main' as a regular branch.
+        respx.get('https://api.github.com/repos/octo/demo/').mock(
+            return_value=httpx.Response(200, json={'default_branch': 'master'})
+        )
+        respx.get('https://api.github.com/repos/octo/demo/branches').mock(
+            return_value=httpx.Response(
+                200,
+                json=[
+                    {'name': 'master', 'commit': {'sha': 'master-sha'}},
+                    {'name': 'main', 'commit': {'sha': 'main-sha'}},
+                ],
+            )
+        )
+        plugin = GitHubDeploymentPlugin()
+        refs = await plugin.list_refs(_ctx(), _CREDS, kind='branch')
+        names = [r.name for r in refs]
+        self.assertNotIn('master', names)
+        self.assertIn('main', names)
+
+    @respx.mock
     async def test_list_refs_branches_filters_by_query(self) -> None:
+        respx.get('https://api.github.com/repos/octo/demo/').mock(
+            return_value=httpx.Response(200, json={'default_branch': 'main'})
+        )
         respx.get('https://api.github.com/repos/octo/demo/branches').mock(
             return_value=httpx.Response(
                 200,
@@ -332,6 +362,12 @@ class CompareTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.base_sha, 'base-sha')
 
 
+def _now_iso() -> str:
+    return (
+        datetime.datetime.now(datetime.UTC) + datetime.timedelta(seconds=1)
+    ).isoformat()
+
+
 class TriggerDeploymentTestCase(unittest.IsolatedAsyncioTestCase):
     @respx.mock
     async def test_trigger_dispatch_default_workflow(self) -> None:
@@ -350,6 +386,9 @@ class TriggerDeploymentTestCase(unittest.IsolatedAsyncioTestCase):
                         {
                             'id': 999,
                             'html_url': 'https://gh/runs/999',
+                            'created_at': _now_iso(),
+                            'head_branch': 'main',
+                            'head_sha': 'main-sha',
                         }
                     ]
                 },
@@ -403,6 +442,86 @@ class TriggerDeploymentTestCase(unittest.IsolatedAsyncioTestCase):
         body = dispatch.calls.last.request.read().decode()
         self.assertIn('"env":"staging"', body)
         self.assertIn('"commit":"abc123"', body)
+
+    @respx.mock
+    async def test_trigger_ignores_unrelated_concurrent_run(self) -> None:
+        # Another dispatch (different branch) lands first.  We should
+        # match the run whose ``head_branch`` matches our ref, not the
+        # one that happens to be newest.
+        respx.post(
+            'https://api.github.com/repos/octo/demo/actions/workflows/'
+            'deploy.yml/dispatches'
+        ).mock(return_value=httpx.Response(204))
+        respx.get(
+            'https://api.github.com/repos/octo/demo/actions/workflows/'
+            'deploy.yml/runs'
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    'workflow_runs': [
+                        {
+                            'id': 111,
+                            'html_url': 'https://gh/runs/111',
+                            'created_at': _now_iso(),
+                            'head_branch': 'someone-else',
+                            'head_sha': 'other-sha',
+                        },
+                        {
+                            'id': 222,
+                            'html_url': 'https://gh/runs/222',
+                            'created_at': _now_iso(),
+                            'head_branch': 'main',
+                            'head_sha': 'main-sha',
+                        },
+                    ]
+                },
+            )
+        )
+        plugin = GitHubDeploymentPlugin()
+        run = await plugin.trigger_deployment(
+            _ctx(environment='testing'),
+            _CREDS,
+            ref_or_sha='main',
+        )
+        self.assertEqual(run.run_id, '222')
+
+    @respx.mock
+    async def test_trigger_ignores_run_created_before_dispatch(self) -> None:
+        # A pre-existing run on the same branch should not be picked up.
+        old = (
+            datetime.datetime.now(datetime.UTC) - datetime.timedelta(minutes=5)
+        ).isoformat()
+        respx.post(
+            'https://api.github.com/repos/octo/demo/actions/workflows/'
+            'deploy.yml/dispatches'
+        ).mock(return_value=httpx.Response(204))
+        respx.get(
+            'https://api.github.com/repos/octo/demo/actions/workflows/'
+            'deploy.yml/runs'
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    'workflow_runs': [
+                        {
+                            'id': 1,
+                            'html_url': 'https://gh/runs/1',
+                            'created_at': old,
+                            'head_branch': 'main',
+                            'head_sha': 'main-sha',
+                        }
+                    ]
+                },
+            )
+        )
+        plugin = GitHubDeploymentPlugin()
+        run = await plugin.trigger_deployment(
+            _ctx(environment='testing'),
+            _CREDS,
+            ref_or_sha='main',
+        )
+        self.assertEqual(run.run_id, '')
 
 
 class GetDeploymentStatusTestCase(unittest.IsolatedAsyncioTestCase):

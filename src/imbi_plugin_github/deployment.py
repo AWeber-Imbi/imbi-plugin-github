@@ -45,7 +45,6 @@ from imbi_plugin_github._hosts import normalize_host, require_ghec_tenant_host
 LOGGER = logging.getLogger(__name__)
 
 _DEFAULT_WORKFLOW = 'deploy.yml'
-_DEFAULT_DISPATCH_EVENT = 'imbi-deploy'
 _DEFAULT_ENVIRONMENT_INPUT = 'environment'
 _DEFAULT_REF_INPUT = 'ref'
 _HTTP_TIMEOUT_SECONDS = 10.0
@@ -186,20 +185,35 @@ class _DeploymentBase(DeploymentPlugin):
     ) -> list[Ref]:
         async with self._client(ctx, credentials) as client:
             tasks: list[collections.abc.Awaitable[list[Ref]]] = []
-            if kind in ('default', 'all'):
-                tasks.append(self._list_default_ref(client))
-            if kind in ('branch', 'all'):
-                tasks.append(self._list_branches(ctx, client, query=query))
+            if kind in ('default', 'branch', 'all'):
+                # Resolve the repo's actual default branch up front so
+                # ``_list_branches`` can suppress it without guessing —
+                # the manifest option is just a hint and may be stale.
+                default_branch = await self._fetch_default_branch(client)
+                if kind in ('default', 'all'):
+                    tasks.append(
+                        self._list_default_ref(client, default_branch)
+                    )
+                if kind in ('branch', 'all'):
+                    tasks.append(
+                        self._list_branches(
+                            client, default_branch, query=query
+                        )
+                    )
             if kind in ('tag', 'all'):
                 tasks.append(self._list_tags(client, query=query))
             groups = await asyncio.gather(*tasks)
             return [ref for group in groups for ref in group]
 
-    async def _list_default_ref(self, client: httpx.AsyncClient) -> list[Ref]:
+    async def _fetch_default_branch(self, client: httpx.AsyncClient) -> str:
         repo_resp = await client.get('')
         repo_resp.raise_for_status()
         repo_meta = typing.cast(dict[str, typing.Any], repo_resp.json())
-        default_branch = str(repo_meta.get('default_branch') or 'main')
+        return str(repo_meta.get('default_branch') or 'main')
+
+    async def _list_default_ref(
+        self, client: httpx.AsyncClient, default_branch: str
+    ) -> list[Ref]:
         branch_resp = await client.get(f'/branches/{default_branch}')
         if branch_resp.status_code != 200:
             return []
@@ -217,17 +231,14 @@ class _DeploymentBase(DeploymentPlugin):
 
     async def _list_branches(
         self,
-        ctx: PluginContext,
         client: httpx.AsyncClient,
+        default_branch: str,
         query: str | None = None,
     ) -> list[Ref]:
         params: dict[str, str] = {'per_page': '100'}
         resp = await client.get('/branches', params=params)
         resp.raise_for_status()
         rows = typing.cast(list[dict[str, typing.Any]], resp.json())
-        default_branch = str(
-            ctx.assignment_options.get('default_branch') or 'main'
-        )
         out: list[Ref] = []
         for row in rows:
             name = str(row.get('name') or '')
@@ -445,6 +456,13 @@ class _DeploymentBase(DeploymentPlugin):
         }
         if inputs:
             body_inputs.update(inputs)
+        # Capture the dispatch instant *before* POSTing so we can
+        # correlate the resulting workflow run on the listing endpoint.
+        # GitHub records ``created_at`` with second precision, so subtract
+        # a small skew to avoid losing the run to clock drift.
+        dispatch_started = datetime.datetime.now(
+            datetime.UTC
+        ) - datetime.timedelta(seconds=2)
         async with self._client(ctx, credentials) as client:
             dispatch_resp = await client.post(
                 f'/actions/workflows/{workflow}/dispatches',
@@ -452,10 +470,12 @@ class _DeploymentBase(DeploymentPlugin):
             )
             dispatch_resp.raise_for_status()
             # GitHub returns 204 with no body — find the run we just
-            # created by listing recent runs filtered to this workflow.
+            # created by listing recent runs and matching event +
+            # creation time (and ref when present) so a concurrent
+            # dispatch can't bind us to its run.
             runs_resp = await client.get(
                 f'/actions/workflows/{workflow}/runs',
-                params={'per_page': '5'},
+                params={'event': 'workflow_dispatch', 'per_page': '10'},
             )
             run_id = ''
             run_url: str | None = None
@@ -464,14 +484,50 @@ class _DeploymentBase(DeploymentPlugin):
                 runs: list[dict[str, typing.Any]] = (
                     payload.get('workflow_runs') or []
                 )
-                if runs:
-                    run_id = str(runs[0].get('id') or '')
-                    run_url = runs[0].get('html_url')
+                match = self._match_dispatched_run(
+                    runs, dispatch_started, ref_or_sha
+                )
+                if match is not None:
+                    run_id = str(match.get('id') or '')
+                    run_url = match.get('html_url')
             return DeploymentRun(
                 run_id=run_id,
                 run_url=run_url,
                 status='queued',
             )
+
+    @staticmethod
+    def _match_dispatched_run(
+        runs: list[dict[str, typing.Any]],
+        dispatch_started: datetime.datetime,
+        ref_or_sha: str,
+    ) -> dict[str, typing.Any] | None:
+        """Pick the run created by the dispatch we just issued.
+
+        Filters to runs created at or after ``dispatch_started`` and,
+        when the supplied ref names a branch, to runs whose
+        ``head_branch`` matches.  Returns ``None`` when no run is an
+        unambiguous match — the caller surfaces an empty ``run_id``
+        rather than binding to someone else's run.
+        """
+        candidates: list[dict[str, typing.Any]] = []
+        for run in runs:
+            created = _parse_iso(run.get('created_at'))
+            if created is None or created < dispatch_started:
+                continue
+            head_branch = run.get('head_branch')
+            head_sha = run.get('head_sha')
+            if head_branch == ref_or_sha or head_sha == ref_or_sha:
+                candidates.append(run)
+                continue
+            # When the ref doesn't match either field, only accept
+            # the run if there are no other candidates — otherwise
+            # we cannot tell ours from a concurrent dispatch.
+            if head_branch is None and head_sha is None:
+                candidates.append(run)
+        if len(candidates) == 1:
+            return candidates[0]
+        return None
 
     async def get_deployment_status(
         self,
@@ -541,16 +597,6 @@ _COMMON_OPTIONS: list[PluginOption] = [
         description='File name in .github/workflows to dispatch.',
         type='string',
         default=_DEFAULT_WORKFLOW,
-    ),
-    PluginOption(
-        name='dispatch_event_type',
-        label='repository_dispatch event_type',
-        description=(
-            'Used when the workflow opts into ``repository_dispatch`` '
-            'instead of ``workflow_dispatch``.'
-        ),
-        type='string',
-        default=_DEFAULT_DISPATCH_EVENT,
     ),
     PluginOption(
         name='environment_input',

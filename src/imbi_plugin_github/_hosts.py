@@ -27,6 +27,7 @@ def normalize_host(raw: typing.Any, label: str) -> str:
     )
     if (
         not parsed.hostname
+        or parsed.port is not None
         or parsed.path not in ('', '/')
         or parsed.query
         or parsed.fragment
