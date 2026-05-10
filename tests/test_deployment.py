@@ -2,6 +2,7 @@
 
 import datetime
 import json
+import time
 import unittest
 
 import httpx
@@ -193,6 +194,38 @@ class ManifestTestCase(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             plugin._owner_repo(ctx)
+
+    def test_record_checks_disabled_evicts_expired(self) -> None:
+        """``_record_checks_disabled`` must sweep stale entries before
+        inserting; otherwise the cache grows unbounded."""
+        from imbi_plugin_github import deployment as dep
+
+        # Re-bind into the module so the helper writes into a sandbox we
+        # can inspect, then restore on teardown.
+        original = dep._CHECKS_DISABLED_TOKENS
+        dep._CHECKS_DISABLED_TOKENS = {
+            'stale-key': time.monotonic()
+            - dep._CHECKS_DISABLED_TTL_SECONDS
+            - 1,
+            'fresh-key': time.monotonic(),
+        }
+        try:
+            dep._record_checks_disabled(
+                {'access_token': 'gho_record'}, 'github.com', 'octo', 'demo'
+            )
+            # The stale entry is gone; the fresh one and the new key remain.
+            self.assertNotIn('stale-key', dep._CHECKS_DISABLED_TOKENS)
+            self.assertIn('fresh-key', dep._CHECKS_DISABLED_TOKENS)
+            self.assertEqual(len(dep._CHECKS_DISABLED_TOKENS), 2)
+        finally:
+            dep._CHECKS_DISABLED_TOKENS = original
+
+    def test_record_checks_disabled_skips_when_no_token(self) -> None:
+        from imbi_plugin_github import deployment as dep
+
+        original = dict(dep._CHECKS_DISABLED_TOKENS)
+        dep._record_checks_disabled({}, 'github.com', 'octo', 'demo')
+        self.assertEqual(dep._CHECKS_DISABLED_TOKENS, original)
 
     def test_token_required(self) -> None:
         with self.assertRaises(ValueError):
