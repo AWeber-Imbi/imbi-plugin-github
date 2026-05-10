@@ -36,24 +36,19 @@ from imbi_plugin_github._hosts import normalize_host, require_ghec_tenant_host
 
 LOGGER = logging.getLogger(__name__)
 
-# Default scope set for the GitHub identity flow. Covers everything
-# the GitHub plugin family currently consumes:
+# Default scope set for the GitHub identity flow.  Kept minimal —
+# only the scopes needed for sign-in and org membership checks:
 #   * ``read:user`` / ``user:email``     — identity + verified email
 #   * ``read:org``                       — org/team membership lookups
-#   * ``repo``                           — read commits, branches, tags,
-#                                          check-runs, releases, and
-#                                          private repo metadata for the
-#                                          deployment plugin
-#   * ``workflow``                       — trigger ``workflow_dispatch``
-#                                          for deployments
-# Operators that need a narrower bind can override this on the
-# identity assignment via the ``default_scopes`` plugin option.
+# Deployment-capable assignments (read commits/branches/tags/check-runs,
+# trigger ``workflow_dispatch``) need ``repo`` and ``workflow``.  Add
+# them via the ``default_scopes`` plugin option on the assignment, e.g.
+# ``read:user user:email read:org repo workflow``.  Granting write-
+# capable scopes by default would be a least-privilege regression.
 DEFAULT_SCOPES = [
     'read:user',
     'user:email',
     'read:org',
-    'repo',
-    'workflow',
 ]
 
 

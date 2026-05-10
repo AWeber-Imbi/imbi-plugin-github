@@ -149,6 +149,51 @@ class ManifestTestCase(unittest.TestCase):
         )
         self.assertEqual(plugin._owner_repo(ctx), ('from-link', 'repo'))
 
+    def test_owner_repo_prefers_explicit_repo_link(self) -> None:
+        """Explicit ``github-repository`` link key wins over other
+        same-host links, even when it appears later in dict order."""
+        plugin = GitHubDeploymentPlugin()
+        ctx = PluginContext(
+            project_id='p',
+            project_slug='proj',
+            org_slug='octo',
+            assignment_options={},
+            project_links={
+                'docs': 'https://github.com/other-org/other-repo',
+                'github-repository': 'https://github.com/correct/repo',
+            },
+        )
+        self.assertEqual(plugin._owner_repo(ctx), ('correct', 'repo'))
+
+    def test_owner_repo_rejects_orgs_path(self) -> None:
+        """``github.com/orgs/<org>`` is not a repository URL — fall
+        through to the project_type fallback rather than binding to
+        ``orgs/<org>``."""
+        plugin = GitHubDeploymentPlugin()
+        ctx = PluginContext(
+            project_id='p',
+            project_slug='account',
+            org_slug='octo',
+            assignment_options={},
+            project_links={'github-org': 'https://github.com/orgs/octo'},
+            project_type_slugs=['apis'],
+        )
+        self.assertEqual(plugin._owner_repo(ctx), ('apis', 'account'))
+
+    def test_owner_repo_rejects_marketplace_path(self) -> None:
+        plugin = GitHubDeploymentPlugin()
+        ctx = PluginContext(
+            project_id='p',
+            project_slug='proj',
+            org_slug='octo',
+            assignment_options={},
+            project_links={
+                'marketplace': 'https://github.com/marketplace/actions/checkout'
+            },
+        )
+        with self.assertRaises(ValueError):
+            plugin._owner_repo(ctx)
+
     def test_token_required(self) -> None:
         with self.assertRaises(ValueError):
             GitHubDeploymentPlugin._token({})

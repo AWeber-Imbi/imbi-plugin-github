@@ -57,13 +57,15 @@ _HTTP_TIMEOUT_SECONDS = 10.0
 # the deployment-plugin UI's purposes.
 _MAX_REF_PAGES = 10
 
-# Process-wide cache of access tokens for which the GitHub
-# ``/check-runs`` endpoint has already returned 403 (insufficient
+# Process-wide cache of (token, host, repo) tuples for which the
+# GitHub ``/check-runs`` endpoint has already returned 403 (insufficient
 # scope, or Actions disabled on the repo). Keys are short SHA-256
-# digests of the bearer token, values are the unix timestamp at which
-# the entry was recorded. Hydrating commit CI status spawns one call
-# per commit; without this cache a missing scope produces 25+ wasted
-# 403s every time the deploy dialog opens.
+# digests over the bearer token plus the resolved host and
+# ``<owner>/<repo>`` so a single forbidden repo doesn't suppress CI
+# status for every other repo the same user opens. Values are the
+# unix timestamp at which the entry was recorded. Hydrating commit
+# CI status spawns one call per commit; without this cache a missing
+# scope produces 25+ wasted 403s every time the deploy dialog opens.
 _CHECKS_DISABLED_TOKENS: dict[str, float] = {}
 # How long to remember a 403 before re-probing. Long enough that a
 # scope fix takes effect on the next session, short enough that we
@@ -145,21 +147,29 @@ def _parse_iso(value: str | None) -> datetime.datetime | None:
         return None
 
 
-def _checks_token_key(credentials: dict[str, str]) -> str | None:
-    """Hash the bearer token so we can key the 403 cache without
-    holding raw credentials in module state.
+def _checks_cache_key(
+    credentials: dict[str, str], host: str, owner: str, repo: str
+) -> str | None:
+    """Hash the bearer token together with the resolved host and
+    ``<owner>/<repo>`` so the 403 cache is scoped per repo+host+token.
+
+    Returns ``None`` when no token is present, which short-circuits
+    both ``_checks_disabled`` and ``_record_checks_disabled``.
     """
     token = credentials.get('access_token') or credentials.get('token')
     if not token:
         return None
-    return hashlib.sha256(token.encode()).hexdigest()
+    material = f'{token}\n{host.lower()}\n{owner}/{repo}'
+    return hashlib.sha256(material.encode()).hexdigest()
 
 
-def _checks_disabled(credentials: dict[str, str]) -> bool:
-    """Return ``True`` when this token has 403'd on ``/check-runs``
-    recently enough that we shouldn't probe again.
+def _checks_disabled(
+    credentials: dict[str, str], host: str, owner: str, repo: str
+) -> bool:
+    """Return ``True`` when this (token, host, repo) tuple has 403'd
+    on ``/check-runs`` recently enough that we shouldn't probe again.
     """
-    key = _checks_token_key(credentials)
+    key = _checks_cache_key(credentials, host, owner, repo)
     if key is None:
         return False
     recorded = _CHECKS_DISABLED_TOKENS.get(key)
@@ -171,9 +181,13 @@ def _checks_disabled(credentials: dict[str, str]) -> bool:
     return True
 
 
-def _record_checks_disabled(credentials: dict[str, str]) -> None:
-    """Mark this token as forbidden from ``/check-runs`` for the TTL."""
-    key = _checks_token_key(credentials)
+def _record_checks_disabled(
+    credentials: dict[str, str], host: str, owner: str, repo: str
+) -> None:
+    """Mark this (token, host, repo) as forbidden from ``/check-runs``
+    for the TTL.
+    """
+    key = _checks_cache_key(credentials, host, owner, repo)
     if key is None:
         return
     _CHECKS_DISABLED_TOKENS[key] = time.monotonic()
@@ -241,30 +255,87 @@ class _DeploymentBase(DeploymentPlugin):
             return f'https://api.{host}'
         return f'https://{host}/api/v3'
 
-    @staticmethod
+    # Reserved GitHub URL prefixes that share the host with repository
+    # URLs but never point at a real ``<owner>/<repo>`` pair.  Any link
+    # whose first path segment matches one of these is skipped during
+    # owner/repo derivation so e.g. ``github.com/orgs/<org>`` or a
+    # marketplace link can't silently bind a deployment to the wrong
+    # target.
+    _RESERVED_LINK_PREFIXES = frozenset(
+        {
+            'orgs',
+            'marketplace',
+            'settings',
+            'enterprises',
+            'features',
+            'pricing',
+            'about',
+            'login',
+            'logout',
+            'signup',
+            'sponsors',
+            'topics',
+            'collections',
+            'trending',
+            'codespaces',
+            'notifications',
+            'issues',
+            'pulls',
+            'search',
+            'stars',
+            'explore',
+        }
+    )
+
+    @classmethod
     def _derive_owner_repo_from_links(
-        links: dict[str, str], host: str
+        cls, links: dict[str, str], host: str
     ) -> tuple[str, str] | None:
         """Find a project link pointing at ``host`` and parse owner/repo.
 
-        Scans the project's external links for a URL whose hostname
-        matches ``host`` (case-insensitive) and extracts the first two
-        path segments as ``(owner, repo)``. A trailing ``.git`` suffix
-        on the repo is stripped. Returns ``None`` when no link matches
-        or the path is too short.
+        Prefers an explicit ``github-repository`` link key when one is
+        present and points at ``host``; otherwise scans the remaining
+        same-host links and returns the first usable one.  Path entries
+        whose first segment is a reserved GitHub route (e.g. ``orgs``,
+        ``marketplace``) are rejected so a non-repo URL can't silently
+        bind the deployment to a wrong target.  A trailing ``.git`` is
+        stripped from the repo segment.  Returns ``None`` when nothing
+        matches.
         """
         target = host.lower()
-        for url in links.values():
-            try:
-                parsed = urllib.parse.urlparse(url)
-            except ValueError:
+        preferred = links.get('github-repository')
+        if preferred is not None:
+            owner_repo = cls._parse_owner_repo(preferred, target)
+            if owner_repo is not None:
+                return owner_repo
+        for key, url in links.items():
+            if key == 'github-repository':
                 continue
-            if (parsed.hostname or '').lower() != target:
-                continue
-            parts = [p for p in parsed.path.split('/') if p]
-            if len(parts) >= 2:
-                return parts[0], parts[1].removesuffix('.git')
+            owner_repo = cls._parse_owner_repo(url, target)
+            if owner_repo is not None:
+                return owner_repo
         return None
+
+    @classmethod
+    def _parse_owner_repo(
+        cls, url: str, target_host: str
+    ) -> tuple[str, str] | None:
+        """Extract ``(owner, repo)`` from ``url`` when it's a repo URL on
+        ``target_host``.  Returns ``None`` for other hosts, short paths,
+        or reserved-prefix paths like ``/orgs/<org>``.
+        """
+        try:
+            parsed = urllib.parse.urlparse(url)
+        except ValueError:
+            return None
+        if (parsed.hostname or '').lower() != target_host:
+            return None
+        parts = [p for p in parsed.path.split('/') if p]
+        if len(parts) < 2:
+            return None
+        if parts[0].lower() in cls._RESERVED_LINK_PREFIXES:
+            return None
+        return parts[0], parts[1].removesuffix('.git')
 
     def _owner_repo(self, ctx: PluginContext) -> tuple[str, str]:
         derived = self._derive_owner_repo_from_links(
@@ -453,6 +524,8 @@ class _DeploymentBase(DeploymentPlugin):
         limit: int = 25,
     ) -> list[Commit]:
         params = {'sha': ref, 'per_page': str(max(1, min(limit, 100)))}
+        host = self._resolve_host(ctx.assignment_options)
+        owner, repo = self._owner_repo(ctx)
         async with self._client(ctx, credentials) as client:
             resp = await client.get('/commits', params=params)
             resp.raise_for_status()
@@ -460,7 +533,7 @@ class _DeploymentBase(DeploymentPlugin):
             commits = [_commit_from_payload(row) for row in rows]
             if commits:
                 commits[0] = commits[0].model_copy(update={'is_head': True})
-            if not commits or _checks_disabled(credentials):
+            if not commits or _checks_disabled(credentials, host, owner, repo):
                 return commits
             # Probe the head commit synchronously: if check-runs is
             # forbidden for this token (missing scope or Actions
@@ -468,13 +541,17 @@ class _DeploymentBase(DeploymentPlugin):
             # 403 per commit in parallel. Probing first lets the cache
             # short-circuit the rest.
             commits[0] = await self._hydrate_check_status(
-                client, credentials, commits[0]
+                client, credentials, host, owner, repo, commits[0]
             )
-            if len(commits) == 1 or _checks_disabled(credentials):
+            if len(commits) == 1 or _checks_disabled(
+                credentials, host, owner, repo
+            ):
                 return commits
             tail = await asyncio.gather(
                 *(
-                    self._hydrate_check_status(client, credentials, c)
+                    self._hydrate_check_status(
+                        client, credentials, host, owner, repo, c
+                    )
                     for c in commits[1:]
                 )
             )
@@ -484,16 +561,19 @@ class _DeploymentBase(DeploymentPlugin):
         self,
         client: httpx.AsyncClient,
         credentials: dict[str, str],
+        host: str,
+        owner: str,
+        repo: str,
         commit: Commit,
     ) -> Commit:
-        if _checks_disabled(credentials):
+        if _checks_disabled(credentials, host, owner, repo):
             return commit
         try:
             resp = await client.get(f'/commits/{commit.sha}/check-runs')
         except httpx.HTTPError:
             return commit
         if resp.status_code == 403:
-            _record_checks_disabled(credentials)
+            _record_checks_disabled(credentials, host, owner, repo)
             return commit
         if resp.status_code != 200:
             return commit
@@ -734,7 +814,9 @@ class _DeploymentBase(DeploymentPlugin):
         train should never fail to render because a side hydration
         call hiccuped.
         """
-        if _checks_disabled(credentials):
+        host = self._resolve_host(ctx.assignment_options)
+        owner, repo = self._owner_repo(ctx)
+        if _checks_disabled(credentials, host, owner, repo):
             return 'unknown'
         encoded = urllib.parse.quote(committish, safe='')
         async with self._client(ctx, credentials) as client:
@@ -743,7 +825,7 @@ class _DeploymentBase(DeploymentPlugin):
             except httpx.HTTPError:
                 return 'unknown'
             if resp.status_code == 403:
-                _record_checks_disabled(credentials)
+                _record_checks_disabled(credentials, host, owner, repo)
                 return 'unknown'
             if resp.status_code != 200:
                 return 'unknown'

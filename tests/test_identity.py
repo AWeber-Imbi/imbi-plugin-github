@@ -131,7 +131,7 @@ class FlowTestCase(unittest.IsolatedAsyncioTestCase):
         params = urllib.parse.parse_qs(parsed.query)
         self.assertEqual(
             params['scope'],
-            ['read:user user:email read:org repo workflow'],
+            ['read:user user:email read:org'],
         )
         self.assertEqual(params['client_id'], ['cid'])
 
