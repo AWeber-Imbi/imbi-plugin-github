@@ -23,16 +23,14 @@ def _ctx(
     options: dict[str, object] | None = None,
     environment: str | None = None,
 ) -> PluginContext:
-    base: dict[str, object] = {'owner': 'octo', 'repo': 'demo'}
-    if options:
-        base.update(options)
     return PluginContext(
         project_id='p',
         project_slug='proj',
         org_slug='octo',
         environment=environment,
-        assignment_options=base,
+        assignment_options=options or {},
         actor_user_id='u-1',
+        project_links={'github-repository': 'https://github.com/octo/demo'},
     )
 
 
@@ -64,8 +62,92 @@ class ManifestTestCase(unittest.TestCase):
 
     def test_owner_repo_required(self) -> None:
         plugin = GitHubDeploymentPlugin()
+        ctx = PluginContext(
+            project_id='p',
+            project_slug='proj',
+            org_slug='octo',
+            assignment_options={},
+        )
         with self.assertRaises(ValueError):
-            plugin._owner_repo({})
+            plugin._owner_repo(ctx)
+
+    def test_owner_repo_derived_from_project_link(self) -> None:
+        plugin = GitHubDeploymentPlugin()
+        ctx = PluginContext(
+            project_id='p',
+            project_slug='proj',
+            org_slug='octo',
+            assignment_options={},
+            project_links={
+                'github-repository': 'https://github.com/octo/demo'
+            },
+        )
+        self.assertEqual(plugin._owner_repo(ctx), ('octo', 'demo'))
+
+    def test_owner_repo_derived_strips_dot_git(self) -> None:
+        plugin = GitHubDeploymentPlugin()
+        ctx = PluginContext(
+            project_id='p',
+            project_slug='proj',
+            org_slug='octo',
+            assignment_options={},
+            project_links={
+                'github-repository': 'https://github.com/octo/demo.git'
+            },
+        )
+        self.assertEqual(plugin._owner_repo(ctx), ('octo', 'demo'))
+
+    def test_owner_repo_derived_for_ghec_tenant(self) -> None:
+        plugin = GitHubEnterpriseCloudDeploymentPlugin()
+        ctx = PluginContext(
+            project_id='p',
+            project_slug='proj',
+            org_slug='octo',
+            assignment_options={'host': 'aweber.ghe.com'},
+            project_links={
+                'github-repository': 'https://aweber.ghe.com/apis/account'
+            },
+        )
+        self.assertEqual(plugin._owner_repo(ctx), ('apis', 'account'))
+
+    def test_owner_repo_ignores_link_for_other_host(self) -> None:
+        plugin = GitHubDeploymentPlugin()
+        ctx = PluginContext(
+            project_id='p',
+            project_slug='proj',
+            org_slug='octo',
+            assignment_options={},
+            project_links={
+                'gitlab-repository': 'https://gitlab.com/octo/demo'
+            },
+        )
+        with self.assertRaises(ValueError):
+            plugin._owner_repo(ctx)
+
+    def test_owner_repo_falls_back_to_project_type(self) -> None:
+        plugin = GitHubDeploymentPlugin()
+        ctx = PluginContext(
+            project_id='p',
+            project_slug='account',
+            org_slug='octo',
+            assignment_options={},
+            project_type_slugs=['apis'],
+        )
+        self.assertEqual(plugin._owner_repo(ctx), ('apis', 'account'))
+
+    def test_owner_repo_link_wins_over_project_type(self) -> None:
+        plugin = GitHubDeploymentPlugin()
+        ctx = PluginContext(
+            project_id='p',
+            project_slug='account',
+            org_slug='octo',
+            assignment_options={},
+            project_links={
+                'github-repository': 'https://github.com/from-link/repo'
+            },
+            project_type_slugs=['apis'],
+        )
+        self.assertEqual(plugin._owner_repo(ctx), ('from-link', 'repo'))
 
     def test_token_required(self) -> None:
         with self.assertRaises(ValueError):
@@ -103,7 +185,7 @@ class ManifestTestCase(unittest.TestCase):
 class ListRefsTestCase(unittest.IsolatedAsyncioTestCase):
     @respx.mock
     async def test_list_refs_default(self) -> None:
-        respx.get('https://api.github.com/repos/octo/demo/').mock(
+        respx.get('https://api.github.com/repos/octo/demo').mock(
             return_value=httpx.Response(200, json={'default_branch': 'main'})
         )
         respx.get('https://api.github.com/repos/octo/demo/branches/main').mock(
@@ -120,7 +202,7 @@ class ListRefsTestCase(unittest.IsolatedAsyncioTestCase):
 
     @respx.mock
     async def test_list_refs_branches_skips_default(self) -> None:
-        respx.get('https://api.github.com/repos/octo/demo/').mock(
+        respx.get('https://api.github.com/repos/octo/demo').mock(
             return_value=httpx.Response(200, json={'default_branch': 'main'})
         )
         respx.get('https://api.github.com/repos/octo/demo/branches').mock(
@@ -144,7 +226,7 @@ class ListRefsTestCase(unittest.IsolatedAsyncioTestCase):
         # Repo's real default is 'master'; assignment_options says 'main'.
         # The branch list must hide 'master' (the real default) and keep
         # 'main' as a regular branch.
-        respx.get('https://api.github.com/repos/octo/demo/').mock(
+        respx.get('https://api.github.com/repos/octo/demo').mock(
             return_value=httpx.Response(200, json={'default_branch': 'master'})
         )
         respx.get('https://api.github.com/repos/octo/demo/branches').mock(
@@ -164,7 +246,7 @@ class ListRefsTestCase(unittest.IsolatedAsyncioTestCase):
 
     @respx.mock
     async def test_list_refs_branches_filters_by_query(self) -> None:
-        respx.get('https://api.github.com/repos/octo/demo/').mock(
+        respx.get('https://api.github.com/repos/octo/demo').mock(
             return_value=httpx.Response(200, json={'default_branch': 'main'})
         )
         respx.get('https://api.github.com/repos/octo/demo/branches').mock(
@@ -611,7 +693,7 @@ class TriggerDeploymentTestCase(unittest.IsolatedAsyncioTestCase):
 class ListRefsPaginationTestCase(unittest.IsolatedAsyncioTestCase):
     @respx.mock
     async def test_list_branches_follows_next_link(self) -> None:
-        respx.get('https://api.github.com/repos/octo/demo/').mock(
+        respx.get('https://api.github.com/repos/octo/demo').mock(
             return_value=httpx.Response(200, json={'default_branch': 'main'})
         )
         branches_url = 'https://api.github.com/repos/octo/demo/branches'
@@ -875,7 +957,7 @@ class AuthenticationFailureTestCase(unittest.IsolatedAsyncioTestCase):
     async def test_401_on_repo_get_raises_authentication_failed(
         self,
     ) -> None:
-        respx.get('https://api.github.com/repos/octo/demo/').mock(
+        respx.get('https://api.github.com/repos/octo/demo').mock(
             return_value=httpx.Response(
                 401, json={'message': 'Bad credentials'}
             )

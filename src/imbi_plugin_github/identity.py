@@ -36,7 +36,25 @@ from imbi_plugin_github._hosts import normalize_host, require_ghec_tenant_host
 
 LOGGER = logging.getLogger(__name__)
 
-DEFAULT_SCOPES = ['read:user', 'user:email']
+# Default scope set for the GitHub identity flow. Covers everything
+# the GitHub plugin family currently consumes:
+#   * ``read:user`` / ``user:email``     — identity + verified email
+#   * ``read:org``                       — org/team membership lookups
+#   * ``repo``                           — read commits, branches, tags,
+#                                          check-runs, releases, and
+#                                          private repo metadata for the
+#                                          deployment plugin
+#   * ``workflow``                       — trigger ``workflow_dispatch``
+#                                          for deployments
+# Operators that need a narrower bind can override this on the
+# identity assignment via the ``default_scopes`` plugin option.
+DEFAULT_SCOPES = [
+    'read:user',
+    'user:email',
+    'read:org',
+    'repo',
+    'workflow',
+]
 
 
 def _build_userinfo(claims: dict[str, typing.Any]) -> IdentityProfile:
