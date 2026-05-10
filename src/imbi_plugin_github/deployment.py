@@ -186,11 +186,24 @@ def _record_checks_disabled(
 ) -> None:
     """Mark this (token, host, repo) as forbidden from ``/check-runs``
     for the TTL.
+
+    Also opportunistically evicts any entries whose TTL has expired so
+    the dict can't grow unbounded — ``_checks_disabled`` only prunes
+    the key it looks up, which leaves long-tail stale tuples sitting
+    around forever for tokens / repos that never get re-probed.
     """
     key = _checks_cache_key(credentials, host, owner, repo)
     if key is None:
         return
-    _CHECKS_DISABLED_TOKENS[key] = time.monotonic()
+    now = time.monotonic()
+    expired = [
+        k
+        for k, recorded in _CHECKS_DISABLED_TOKENS.items()
+        if now - recorded > _CHECKS_DISABLED_TTL_SECONDS
+    ]
+    for k in expired:
+        _CHECKS_DISABLED_TOKENS.pop(k, None)
+    _CHECKS_DISABLED_TOKENS[key] = now
 
 
 def _commit_from_payload(payload: dict[str, typing.Any]) -> Commit:
