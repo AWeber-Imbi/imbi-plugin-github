@@ -122,9 +122,6 @@ max-complexity = 15
 [tool.uv]
 default-groups = ["dev"]
 
-[tool.uv.sources]
-imbi-common = { path = "../imbi-common", editable = true }
-
 [[tool.uv.index]]
 url = "https://pypi.org/simple"
 default = true
