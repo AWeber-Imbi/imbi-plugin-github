@@ -36,11 +36,13 @@ from imbi_common.plugins.base import (
     DeploymentPlugin,
     DeploymentRun,
     PluginContext,
+    PluginEdgeLabel,
     PluginManifest,
     PluginOption,
     Ref,
     RefInfo,
     ReleaseInfo,
+    WorkflowFile,
 )
 from imbi_common.plugins.errors import PluginAuthenticationFailed
 
@@ -729,12 +731,19 @@ class _DeploymentBase(DeploymentPlugin):
         ref_or_sha: str,
         inputs: dict[str, str] | None = None,
     ) -> DeploymentRun:
-        options = ctx.assignment_options
-        workflow = self._option_str(options, 'workflow', _DEFAULT_WORKFLOW)
+        # Per-env edge wins over the assignment-level defaults so a single
+        # project assignment can pick a different workflow / input names
+        # for each environment.  Absent keys in ``environment_config``
+        # transparently fall through to ``assignment_options``.
+        merged: dict[str, typing.Any] = {
+            **ctx.assignment_options,
+            **ctx.environment_config,
+        }
+        workflow = self._option_str(merged, 'workflow', _DEFAULT_WORKFLOW)
         env_input = self._option_str(
-            options, 'environment_input', _DEFAULT_ENVIRONMENT_INPUT
+            merged, 'environment_input', _DEFAULT_ENVIRONMENT_INPUT
         )
-        ref_input = self._option_str(options, 'ref_input', _DEFAULT_REF_INPUT)
+        ref_input = self._option_str(merged, 'ref_input', _DEFAULT_REF_INPUT)
         if not ctx.environment:
             raise ValueError(
                 'trigger_deployment requires PluginContext.environment'
@@ -812,6 +821,39 @@ class _DeploymentBase(DeploymentPlugin):
         if len(candidates) == 1:
             return candidates[0]
         return None
+
+    async def list_workflows(
+        self,
+        ctx: PluginContext,
+        credentials: dict[str, str],
+    ) -> list[WorkflowFile]:
+        """List ``.github/workflows/*.yml`` registered for the repo.
+
+        Used by the UI to populate a workflow dropdown when an operator
+        wires up the per-environment ``DEPLOYS_VIA`` edge.  Returns only
+        ``active`` workflows by default; callers that need disabled
+        entries can filter the result themselves.  GitHub caps the
+        ``/actions/workflows`` page at 100 — that's more than enough for
+        any real repo, so this intentionally doesn't paginate.
+        """
+        async with self._client(ctx, credentials) as client:
+            resp = await client.get(
+                '/actions/workflows', params={'per_page': '100'}
+            )
+            resp.raise_for_status()
+            payload = typing.cast(dict[str, typing.Any], resp.json())
+            workflows: list[dict[str, typing.Any]] = (
+                payload.get('workflows') or []
+            )
+            return [
+                WorkflowFile(
+                    id=str(w.get('id') or ''),
+                    path=str(w.get('path') or ''),
+                    name=str(w.get('name') or ''),
+                    state=str(w.get('state') or 'active'),
+                )
+                for w in workflows
+            ]
 
     async def get_check_status(
         self,
@@ -913,6 +955,32 @@ _COMMON_OPTIONS: list[PluginOption] = [
     ),
 ]
 
+_COMMON_EDGE_LABELS: list[PluginEdgeLabel] = [
+    PluginEdgeLabel(
+        name='DEPLOYS_VIA',
+        # The edge can hang off the ProjectType (the usual case — every
+        # python-api project deploys to staging via release, etc.) or a
+        # specific Project (rare override slot).
+        from_labels=['ProjectType', 'Project'],
+        to_labels=['Environment'],
+        properties={
+            # 'release'  -> create_tag + create_release; no dispatch
+            # 'dispatch' -> workflow_dispatch only (no new tag/release)
+            'action': 'str',
+            # Workflow file to dispatch.  Optional override; the UI
+            # populates a dropdown via ``list_workflows`` so operators
+            # don't have to type this.
+            'workflow': 'str',
+            # Extra ``workflow_dispatch`` inputs, merged on top of the
+            # reserved ``environment`` / ``ref`` keys the plugin sets.
+            'inputs': 'dict[str, str]',
+            # Per-environment identity override.  Lets ``production``
+            # dispatch as a different OAuth identity than ``staging``.
+            'identity_plugin_id': 'str',
+        },
+    ),
+]
+
 _COMMON_CREDENTIALS: list[CredentialField] = [
     CredentialField(
         name='access_token',
@@ -937,6 +1005,7 @@ class GitHubDeploymentPlugin(_DeploymentBase):
         plugin_type='deployment',
         options=_COMMON_OPTIONS,
         credentials=_COMMON_CREDENTIALS,
+        edge_labels=_COMMON_EDGE_LABELS,
     )
 
     @classmethod
@@ -964,6 +1033,7 @@ class GitHubEnterpriseCloudDeploymentPlugin(_DeploymentBase):
             *_COMMON_OPTIONS,
         ],
         credentials=_COMMON_CREDENTIALS,
+        edge_labels=_COMMON_EDGE_LABELS,
     )
 
     @classmethod
@@ -992,6 +1062,7 @@ class GitHubEnterpriseServerDeploymentPlugin(_DeploymentBase):
             *_COMMON_OPTIONS,
         ],
         credentials=_COMMON_CREDENTIALS,
+        edge_labels=_COMMON_EDGE_LABELS,
     )
 
     @classmethod

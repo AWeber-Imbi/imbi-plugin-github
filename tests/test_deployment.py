@@ -23,6 +23,7 @@ from imbi_plugin_github.deployment import (
 def _ctx(
     options: dict[str, object] | None = None,
     environment: str | None = None,
+    environment_config: dict[str, object] | None = None,
 ) -> PluginContext:
     return PluginContext(
         project_id='p',
@@ -30,6 +31,7 @@ def _ctx(
         org_slug='octo',
         environment=environment,
         assignment_options=options or {},
+        environment_config=environment_config or {},
         actor_user_id='u-1',
         project_links={'github-repository': 'https://github.com/octo/demo'},
     )
@@ -60,6 +62,33 @@ class ManifestTestCase(unittest.TestCase):
         ):
             self.assertIsInstance(cls(), DeploymentPlugin)
             self.assertEqual(cls.manifest.plugin_type, 'deployment')
+
+    def test_all_declare_deploys_via_edge(self) -> None:
+        # Every concrete subclass needs the DEPLOYS_VIA declaration so
+        # admins can wire up per-env config from the plugin-edge UI for
+        # any GitHub flavor (.com / GHEC / GHES).
+        for cls in (
+            GitHubDeploymentPlugin,
+            GitHubEnterpriseCloudDeploymentPlugin,
+            GitHubEnterpriseServerDeploymentPlugin,
+        ):
+            edge = next(
+                (
+                    e
+                    for e in cls.manifest.edge_labels
+                    if e.name == 'DEPLOYS_VIA'
+                ),
+                None,
+            )
+            self.assertIsNotNone(
+                edge, f'{cls.__name__} missing DEPLOYS_VIA edge'
+            )
+            assert edge is not None
+            self.assertEqual(set(edge.from_labels), {'ProjectType', 'Project'})
+            self.assertEqual(edge.to_labels, ['Environment'])
+            self.assertIn('action', edge.properties)
+            self.assertIn('workflow', edge.properties)
+            self.assertEqual(edge.properties['inputs'], 'dict[str, str]')
 
     def test_owner_repo_required(self) -> None:
         plugin = GitHubDeploymentPlugin()
@@ -652,6 +681,39 @@ class TriggerDeploymentTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"commit":"abc123"', body)
 
     @respx.mock
+    async def test_trigger_environment_config_overrides_options(
+        self,
+    ) -> None:
+        # Same shape as test_trigger_uses_custom_workflow_and_inputs but
+        # the values arrive via PluginContext.environment_config (host-
+        # resolved from the DEPLOYS_VIA edge) instead of the assignment
+        # options blob.  The env edge MUST win so a single project
+        # assignment can pick a different workflow per env.
+        dispatch = respx.post(
+            'https://api.github.com/repos/octo/demo/actions/workflows/'
+            'prod-deploy.yml/dispatches'
+        ).mock(return_value=httpx.Response(204))
+        respx.get(
+            'https://api.github.com/repos/octo/demo/actions/workflows/'
+            'prod-deploy.yml/runs'
+        ).mock(return_value=httpx.Response(200, json={'workflow_runs': []}))
+        plugin = GitHubDeploymentPlugin()
+        ctx = _ctx(
+            options={'workflow': 'deploy.yml'},  # would lose to env edge
+            environment='production',
+            environment_config={
+                'workflow': 'prod-deploy.yml',
+                'environment_input': 'target_env',
+                'ref_input': 'release_tag',
+            },
+        )
+        await plugin.trigger_deployment(ctx, _CREDS, ref_or_sha='v1.2.3')
+        self.assertTrue(dispatch.called)
+        body = dispatch.calls.last.request.read().decode()
+        self.assertIn('"target_env":"production"', body)
+        self.assertIn('"release_tag":"v1.2.3"', body)
+
+    @respx.mock
     async def test_trigger_ignores_unrelated_concurrent_run(self) -> None:
         # Another dispatch (different branch) lands first.  We should
         # match the run whose ``head_branch`` matches our ref, not the
@@ -1061,3 +1123,56 @@ class AuthenticationFailureTestCase(unittest.IsolatedAsyncioTestCase):
                 _CREDS,
                 'main',
             )
+
+
+class ListWorkflowsTestCase(unittest.IsolatedAsyncioTestCase):
+    @respx.mock
+    async def test_list_workflows_parses_active_entries(self) -> None:
+        respx.get(
+            'https://api.github.com/repos/octo/demo/actions/workflows'
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    'total_count': 2,
+                    'workflows': [
+                        {
+                            'id': 161335,
+                            'name': 'CI',
+                            'path': '.github/workflows/ci.yml',
+                            'state': 'active',
+                        },
+                        {
+                            'id': 161336,
+                            'name': 'Deploy',
+                            'path': '.github/workflows/deploy.yml',
+                            'state': 'active',
+                        },
+                    ],
+                },
+            )
+        )
+        plugin = GitHubDeploymentPlugin()
+        workflows = await plugin.list_workflows(_ctx(), _CREDS)
+        self.assertEqual(
+            [w.path for w in workflows],
+            [
+                '.github/workflows/ci.yml',
+                '.github/workflows/deploy.yml',
+            ],
+        )
+        self.assertEqual(workflows[0].id, '161335')
+        self.assertEqual(workflows[0].name, 'CI')
+        self.assertEqual(workflows[0].state, 'active')
+
+    @respx.mock
+    async def test_list_workflows_empty_response(self) -> None:
+        respx.get(
+            'https://api.github.com/repos/octo/demo/actions/workflows'
+        ).mock(
+            return_value=httpx.Response(
+                200, json={'total_count': 0, 'workflows': []}
+            )
+        )
+        plugin = GitHubDeploymentPlugin()
+        self.assertEqual(await plugin.list_workflows(_ctx(), _CREDS), [])
