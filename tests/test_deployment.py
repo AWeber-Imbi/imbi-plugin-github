@@ -1,5 +1,6 @@
 """Smoke tests for the GitHub deployment plugins."""
 
+import datetime
 import json
 import time
 import unittest
@@ -874,7 +875,13 @@ class GetDeploymentStatusTestCase(unittest.IsolatedAsyncioTestCase):
 class ListRecentDeploymentsTestCase(unittest.IsolatedAsyncioTestCase):
     @respx.mock
     async def test_one_env_one_deployment_success(self) -> None:
-        respx.get('https://api.github.com/repos/octo/demo/deployments').mock(
+        respx.get(
+            'https://api.github.com/repos/octo/demo/deployments',
+            params={
+                'environment': 'infrastructure-testing',
+                'per_page': '1',
+            },
+        ).mock(
             return_value=httpx.Response(
                 200,
                 json=[
@@ -918,6 +925,12 @@ class ListRecentDeploymentsTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             event.deployment_url,
             'https://api.github.com/repos/octo/demo/deployments/123',
+        )
+        # ``created_at`` must come from the deployment row, not the
+        # latest status row (which is one minute later above).
+        self.assertEqual(
+            event.created_at,
+            datetime.datetime(2026, 5, 13, 14, 0, tzinfo=datetime.UTC),
         )
 
     @respx.mock

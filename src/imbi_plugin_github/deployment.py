@@ -897,7 +897,14 @@ class _DeploymentBase(DeploymentPlugin):
             # "nothing to backfill" rather than failing the resync.
             return []
         resp.raise_for_status()
-        deployments = typing.cast(list[dict[str, typing.Any]], resp.json())
+        try:
+            deployments = typing.cast(list[dict[str, typing.Any]], resp.json())
+        except ValueError:
+            LOGGER.warning(
+                'Failed to parse deployments payload for env=%s',
+                environment,
+            )
+            return []
         observed: list[RemoteDeployment] = []
         for deployment in deployments:
             run = await self._observe_deployment(
