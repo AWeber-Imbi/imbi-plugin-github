@@ -645,7 +645,7 @@ wheels = [
 [[package]]
 name = "imbi-common"
 version = "2.2.0"
-source = { git = "https://github.com/AWeber-Imbi/imbi-common.git?branch=feature%2Fdeployment-resync-plugin-contract#7a156e295c6682de5622d63d2524d82a15481877" }
+source = { git = "https://github.com/AWeber-Imbi/imbi-common.git?branch=main#d48d7bf652054ebb5a5f702c936d81a958c9eb1d" }
 dependencies = [
   { name = "cryptography" },
   { name = "jsonschema-models" },
@@ -702,7 +702,7 @@ dist = [
 [package.metadata]
 requires-dist = [
   { name = "httpx", specifier = ">=0.27" },
-  { name = "imbi-common", git = "https://github.com/AWeber-Imbi/imbi-common.git?branch=feature%2Fdeployment-resync-plugin-contract" },
+  { name = "imbi-common", git = "https://github.com/AWeber-Imbi/imbi-common.git?branch=main" },
   { name = "pydantic", specifier = ">=2" },
 ]
 
@@ -710,7 +710,7 @@ requires-dist = [
 dev = [
   { name = "basedpyright" },
   { name = "coverage", extras = ["toml"] },
-  { name = "imbi-common", extras = ["server", "databases"], git = "https://github.com/AWeber-Imbi/imbi-common.git?branch=feature%2Fdeployment-resync-plugin-contract" },
+  { name = "imbi-common", extras = ["server", "databases"], git = "https://github.com/AWeber-Imbi/imbi-common.git?branch=main" },
   { name = "pre-commit" },
   { name = "pytest" },
   { name = "pytest-asyncio" },
