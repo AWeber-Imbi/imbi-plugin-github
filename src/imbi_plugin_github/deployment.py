@@ -954,7 +954,7 @@ class _DeploymentBase(DeploymentPlugin):
             run_url=status_url,
             deployment_url=str(deployment_url) if deployment_url else None,
             description=str(description) if description else None,
-            creator=creator_login,  # type: ignore[call-arg]  # requires imbi-common >= 2.5.5
+            creator=creator_login,
         )
 
     async def _latest_status(
