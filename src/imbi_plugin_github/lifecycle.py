@@ -186,7 +186,9 @@ class _LifecycleBase(LifecyclePlugin):
                         'archived'
                     ),
                     artifacts={
-                        'repo_url': self._repo_html_url(host, owner, repo),
+                        'repo_url': self._repo_html_url(
+                            host, current_owner, repo
+                        ),
                     },
                 )
 

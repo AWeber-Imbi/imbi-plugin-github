@@ -649,6 +649,43 @@ class RenameRelocationTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reloc.new_owner_repo, 'octo/renamed')
 
     @respx.mock
+    async def test_archive_skip_uses_canonical_owner_in_artifact(
+        self,
+    ) -> None:
+        # External rename moved the repo to a new owner *and* it is already
+        # archived, so we hit the skip path. The artifact URL must reflect
+        # the canonical owner/repo, not the stale link-derived owner.
+        respx.get('https://api.github.com/repos/octo/demo').mock(
+            return_value=httpx.Response(
+                301,
+                headers={
+                    'location': 'https://api.github.com/repositories/123'
+                },
+            )
+        )
+        respx.get('https://api.github.com/repositories/123').mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    'archived': True,
+                    'owner': {'login': 'octo-new'},
+                    'name': 'renamed',
+                    'html_url': 'https://github.com/octo-new/renamed',
+                },
+            )
+        )
+
+        ctx = _ctx()
+        plugin = GitHubLifecyclePlugin()
+        result = await plugin.on_project_archived(ctx, _CREDS)
+
+        self.assertEqual(result.status, 'skipped')
+        self.assertEqual(
+            result.artifacts['repo_url'],
+            'https://github.com/octo-new/renamed',
+        )
+
+    @respx.mock
     async def test_no_relocation_when_not_renamed(self) -> None:
         respx.get('https://api.github.com/repos/octo/demo').mock(
             return_value=httpx.Response(
