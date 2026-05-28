@@ -191,26 +191,6 @@ class _LifecycleBase(LifecyclePlugin):
             return expanded or None
         return None
 
-    def _resolve_repo_for_update(
-        self, ctx: PluginContext, host: str
-    ) -> tuple[str, str]:
-        """Locate the repo for ``on_project_updated``.
-
-        Prefers an explicit ``github-repository`` link (or any same-host
-        link), but when none is present falls back to
-        ``<project_type_slug>/<previous_project_slug>`` so a slug-rename
-        still finds the pre-rename repo on GitHub.  Final fallback is
-        the current slug to match ``resolve_owner_repo`` for non-rename
-        updates.
-        """
-        derived = derive_owner_repo_from_links(ctx.project_links, host)
-        if derived is not None:
-            return derived
-        if ctx.project_type_slugs:
-            slug = ctx.previous_project_slug or ctx.project_slug
-            return ctx.project_type_slugs[0], slug
-        return resolve_owner_repo(ctx, host, 'GitHub lifecycle plugin')
-
     async def on_project_created(
         self,
         ctx: PluginContext,
@@ -271,7 +251,14 @@ class _LifecycleBase(LifecyclePlugin):
         credentials: dict[str, str],
     ) -> LifecycleResult:
         host = self._resolve_host(ctx.assignment_options)
-        owner, repo = self._resolve_repo_for_update(ctx, host)
+        # ``prefer_previous_slug`` so a slug rename still locates the
+        # pre-rename repo on GitHub when the project has no stored link.
+        owner, repo = resolve_owner_repo(
+            ctx,
+            host,
+            'GitHub lifecycle plugin',
+            prefer_previous_slug=True,
+        )
         async with self._client(ctx, credentials) as client:
             current = await self._get_repo(client, owner, repo)
             current_owner = self._current_owner(current, owner)
