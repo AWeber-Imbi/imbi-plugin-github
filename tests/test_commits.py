@@ -8,6 +8,7 @@ import httpx
 import respx
 from imbi_common.models import CommitRecord, TagRecord
 from imbi_common.plugins.base import PluginContext, ServicePlugin
+from imbi_common.plugins.errors import PluginAuthenticationFailed
 
 from imbi_plugin_github import commits
 
@@ -36,6 +37,7 @@ def _ctx(
         org_slug='octo',
         assignment_options=options,
         service_plugins=service_plugins or [],
+        project_links={'github-repository': 'https://github.com/octo/demo'},
     )
 
 
@@ -454,6 +456,55 @@ class SyncTagsTestCase(unittest.IsolatedAsyncioTestCase):
         _, records = _await_args(insert)
         names = {r.name for r in records}
         self.assertEqual({'v1.2.3', 'v1.0.0'}, names)
+
+    @respx.mock
+    async def test_reconcile_all_paginates(self) -> None:
+        sha = 't' * 40
+        respx.get(
+            f'https://api.github.com/repos/octo/demo/git/tags/{sha}'
+        ).mock(return_value=httpx.Response(404))
+        url = 'https://api.github.com/repos/octo/demo/tags'
+        respx.get(url).mock(
+            side_effect=[
+                httpx.Response(
+                    200,
+                    json=[{'name': 'v1.2.3', 'commit': {'sha': sha}}],
+                    headers={'link': f'<{url}?page=2>; rel="next"'},
+                ),
+                httpx.Response(
+                    200,
+                    json=[{'name': 'v1.0.0', 'commit': {'sha': 'z' * 40}}],
+                ),
+            ]
+        )
+        with mock.patch(_INSERT, new=mock.AsyncMock()) as insert:
+            await commits.sync_tags(
+                ctx=_ctx(),
+                credentials=_CREDS,
+                external_identifier='',
+                action_config=commits.SyncTagsConfig(reconcile_all=True),
+                payload=self._tag_push(after=sha),
+            )
+        _, records = _await_args(insert)
+        names = {r.name for r in records}
+        self.assertEqual({'v1.2.3', 'v1.0.0'}, names)
+
+    @respx.mock
+    async def test_401_raises_authentication_failed(self) -> None:
+        sha = 't' * 40
+        respx.get(
+            f'https://api.github.com/repos/octo/demo/git/tags/{sha}'
+        ).mock(return_value=httpx.Response(401, json={'message': 'Bad creds'}))
+        with mock.patch(_INSERT, new=mock.AsyncMock()) as insert:
+            with self.assertRaises(PluginAuthenticationFailed):
+                await commits.sync_tags(
+                    ctx=_ctx(),
+                    credentials=_CREDS,
+                    external_identifier='',
+                    action_config=commits.SyncTagsConfig(),
+                    payload=self._tag_push(after=sha),
+                )
+        insert.assert_not_awaited()
 
     async def test_non_tag_ref_short_circuits(self) -> None:
         payload = self._tag_push()

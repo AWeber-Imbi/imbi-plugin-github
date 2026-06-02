@@ -57,6 +57,7 @@ from imbi_plugin_github.deployment import (
     _next_page_url,  # pyright: ignore[reportPrivateUsage]
     _parse_iso,  # pyright: ignore[reportPrivateUsage]
     _query_param,  # pyright: ignore[reportPrivateUsage]
+    _raise_on_401,  # pyright: ignore[reportPrivateUsage]
     _short_sha,  # pyright: ignore[reportPrivateUsage]
 )
 
@@ -214,6 +215,7 @@ def _client(base: str, owner: str, repo: str, token: str) -> httpx.AsyncClient:
         base_url=f'{base}/repos/{owner}/{repo}',
         headers=_auth_headers(token),
         timeout=_HTTP_TIMEOUT_SECONDS,
+        event_hooks={'response': [_raise_on_401]},
     )
 
 
@@ -458,17 +460,27 @@ async def _reconcile_tags(
 ) -> list[TagRecord]:
     """Upsert the repo's full tag list (lightweight); ``ReplacingMergeTree``
     dedupes against rows recorded from individual pushes."""
-    resp = await client.get('/tags', params={'per_page': '100'})
-    resp.raise_for_status()
-    rows = typing.cast('list[dict[str, typing.Any]]', resp.json())
     out: list[TagRecord] = []
-    for row in rows:
-        name = str(row.get('name') or '')
-        commit: dict[str, typing.Any] = row.get('commit') or {}
-        sha = str(commit.get('sha') or '')
-        if name and sha:
-            out.append(_tag_record(project_id=project_id, name=name, sha=sha))
-    return out
+    params: dict[str, str] = {'per_page': '100'}
+    while True:
+        resp = await client.get('/tags', params=params)
+        resp.raise_for_status()
+        rows = typing.cast('list[dict[str, typing.Any]]', resp.json())
+        for row in rows:
+            name = str(row.get('name') or '')
+            commit: dict[str, typing.Any] = row.get('commit') or {}
+            sha = str(commit.get('sha') or '')
+            if name and sha:
+                out.append(
+                    _tag_record(project_id=project_id, name=name, sha=sha)
+                )
+        next_url = _next_page_url(resp.headers.get('link'))
+        if next_url is None:
+            return out
+        next_page = _query_param(next_url, 'page')
+        if next_page is None:
+            return out
+        params['page'] = next_page
 
 
 async def sync_tags(
