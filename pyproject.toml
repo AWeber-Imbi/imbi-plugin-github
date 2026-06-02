@@ -16,7 +16,7 @@ classifiers = [
 ]
 dependencies = [
   "httpx>=0.27",
-  "imbi-common==2.8.0",
+  "imbi-common[databases]==2.8.0",
   "pydantic>=2",
 ]
 
@@ -30,6 +30,7 @@ github-deployment-es = "imbi_plugin_github.deployment:GitHubEnterpriseServerDepl
 github-lifecycle = "imbi_plugin_github.lifecycle:GitHubLifecyclePlugin"
 github-lifecycle-ec = "imbi_plugin_github.lifecycle:GitHubEnterpriseCloudLifecyclePlugin"
 github-lifecycle-es = "imbi_plugin_github.lifecycle:GitHubEnterpriseServerLifecyclePlugin"
+github-commit-sync = "imbi_plugin_github.commits:GitHubCommitSyncPlugin"
 
 [dependency-groups]
 dev = [
