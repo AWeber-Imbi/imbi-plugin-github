@@ -740,6 +740,40 @@ class AppAuthSyncTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, token_route.call_count)
 
     @respx.mock
+    async def test_stale_cached_install_rediscovered_on_404(self) -> None:
+        # Seed the install cache with a now-stale id, then make minting
+        # against it 404 (uninstall/reinstall). The token call should
+        # evict the stale id, rediscover, and mint against the new one.
+        _app_auth._INSTALL_CACHE[
+            ('971', 'https://api.github.com', 'octo', 'demo')
+        ] = '7'
+        stale = respx.post(
+            'https://api.github.com/app/installations/7/access_tokens'
+        ).mock(return_value=httpx.Response(404, json={'message': 'gone'}))
+        discovery = respx.get(
+            'https://api.github.com/repos/octo/demo/installation'
+        ).mock(return_value=httpx.Response(200, json={'id': 42}))
+        fresh = self._mock_token()
+        token = await _app_auth.installation_token(
+            base='https://api.github.com',
+            app_id='971',
+            private_key=_APP_KEY_PEM,
+            installation_id=None,
+            owner='octo',
+            repo='demo',
+        )
+        self.assertEqual('ghs_minted', token)
+        self.assertEqual(1, stale.call_count)
+        self.assertEqual(1, discovery.call_count)
+        self.assertEqual(1, fresh.call_count)
+        self.assertEqual(
+            '42',
+            _app_auth._INSTALL_CACHE[
+                ('971', 'https://api.github.com', 'octo', 'demo')
+            ],
+        )
+
+    @respx.mock
     async def test_base64_private_key_accepted(self) -> None:
         self._mock_token()
         self._mock_compare()

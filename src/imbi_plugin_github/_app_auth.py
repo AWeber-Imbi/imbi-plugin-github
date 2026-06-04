@@ -28,6 +28,7 @@ import jwt
 
 from imbi_plugin_github.deployment import (
     _auth_headers,  # pyright: ignore[reportPrivateUsage]
+    _raise_on_401,  # pyright: ignore[reportPrivateUsage]
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -161,18 +162,32 @@ async def installation_token(
         ):
             return cached
 
+    install_was_cached = install is not None and installation_id is None
     app_token = _app_jwt(app_id, private_key)
     async with httpx.AsyncClient(
         base_url=base,
         headers=_auth_headers(app_token),
         timeout=_HTTP_TIMEOUT_SECONDS,
+        event_hooks={'response': [_raise_on_401]},
     ) as client:
         if install is None:
             install = await _discover_installation_id(client, owner, repo)
             _INSTALL_CACHE[(app_id, base, owner, repo)] = install
             if cached := _cached_token((app_id, install, base)):
                 return cached
-        token, expires_at = await _mint(client, install)
+        try:
+            token, expires_at = await _mint(client, install)
+        except httpx.HTTPStatusError as exc:
+            # A 404 (or 401, surfaced as PluginAuthenticationFailed by the
+            # response hook) against a *cached* installation id means the
+            # app was uninstalled/reinstalled or transferred. Evict the
+            # stale id and rediscover once before giving up.
+            if not install_was_cached or exc.response.status_code != 404:
+                raise
+            _INSTALL_CACHE.pop((app_id, base, owner, repo), None)
+            install = await _discover_installation_id(client, owner, repo)
+            _INSTALL_CACHE[(app_id, base, owner, repo)] = install
+            token, expires_at = await _mint(client, install)
     _TOKEN_CACHE[(app_id, install, base)] = (
         token,
         _token_deadline(expires_at),
