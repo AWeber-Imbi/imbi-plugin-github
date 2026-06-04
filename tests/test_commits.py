@@ -498,6 +498,14 @@ class SyncTagsTestCase(unittest.IsolatedAsyncioTestCase):
         _, records = _await_args(insert)
         names = {r.name for r in records}
         self.assertEqual({'v1.2.3', 'v1.0.0'}, names)
+        urls = {r.name: r.url for r in records}
+        self.assertEqual(
+            {
+                'v1.2.3': 'https://github.com/octo/demo/releases/tag/v1.2.3',
+                'v1.0.0': 'https://github.com/octo/demo/releases/tag/v1.0.0',
+            },
+            urls,
+        )
 
     @respx.mock
     async def test_reconcile_all_paginates(self) -> None:
@@ -540,6 +548,14 @@ class SyncTagsTestCase(unittest.IsolatedAsyncioTestCase):
         _, records = _await_args(insert)
         names = {r.name for r in records}
         self.assertEqual({'v1.2.3', 'v1.0.0'}, names)
+        urls = {r.name: r.url for r in records}
+        self.assertEqual(
+            {
+                'v1.2.3': 'https://github.com/octo/demo/releases/tag/v1.2.3',
+                'v1.0.0': 'https://github.com/octo/demo/releases/tag/v1.0.0',
+            },
+            urls,
+        )
 
     @respx.mock
     async def test_401_raises_authentication_failed(self) -> None:
@@ -900,6 +916,17 @@ class SyncAllHistoryTestCase(unittest.IsolatedAsyncioTestCase):
         records = commit_call.args[1]
         self.assertIsInstance(records[0], CommitRecord)
         self.assertEqual('main', records[0].ref)
+        tag_call = next(
+            c for c in insert.await_args_list if c.args[0] == 'tags'
+        )
+        urls = {r.name: r.url for r in tag_call.args[1]}
+        self.assertEqual(
+            {
+                'v1.0.0': 'https://github.com/octo/demo/releases/tag/v1.0.0',
+                'v1.1.0': 'https://github.com/octo/demo/releases/tag/v1.1.0',
+            },
+            urls,
+        )
 
     @respx.mock
     async def test_paginates_commits(self) -> None:
