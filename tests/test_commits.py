@@ -1295,7 +1295,7 @@ class ResolveUserCacheTestCase(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         commits._USER_CACHE.clear()
 
-    async def test_hits_and_misses_cached(self) -> None:
+    async def test_hits_cached_misses_requeried(self) -> None:
         resolver = mock.AsyncMock(
             side_effect=lambda s: 'a@e.com' if s == '1' else None
         )
@@ -1304,12 +1304,16 @@ class ResolveUserCacheTestCase(unittest.IsolatedAsyncioTestCase):
             'a@e.com', await commits._resolve_user(resolver, base, '1')
         )
         self.assertIsNone(await commits._resolve_user(resolver, base, '2'))
-        # Repeats are served from cache -- both the hit and the miss.
+        # The hit is served from cache on repeat; the miss is re-queried
+        # so a contributor who links their identity later is eventually
+        # resolved instead of being memoized as unresolved.
         self.assertEqual(
             'a@e.com', await commits._resolve_user(resolver, base, '1')
         )
         self.assertIsNone(await commits._resolve_user(resolver, base, '2'))
-        self.assertEqual(2, resolver.await_count)
+        self.assertEqual(3, resolver.await_count)
+        self.assertIn((base, '1'), commits._USER_CACHE)
+        self.assertNotIn((base, '2'), commits._USER_CACHE)
 
     async def test_key_scoped_by_base(self) -> None:
         resolver = mock.AsyncMock(return_value='x@e.com')
@@ -1343,6 +1347,22 @@ class ResolveUserCacheTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({'7': 'dev@e.com'}, out)
         # Distinct ids 7 and 8 only -- the duplicate is collapsed.
         self.assertEqual(2, resolver.await_count)
+
+    async def test_author_users_skips_resolver_errors(self) -> None:
+        def _resolve(subject: str) -> str:
+            if subject == '9':
+                raise RuntimeError('identity store unavailable')
+            return 'ok@e.com'
+
+        resolver = mock.AsyncMock(side_effect=_resolve)
+        raw: list[dict[str, typing.Any]] = [
+            {'author': {'id': 9}},  # resolver raises -> skipped
+            {'author': {'id': 10}},  # resolves normally
+        ]
+        # A failing lookup is best-effort: it is logged and dropped, the
+        # other authors still resolve, and the sync is not aborted.
+        out = await commits._resolve_author_users(raw, resolver, 'base')
+        self.assertEqual({'10': 'ok@e.com'}, out)
 
     async def test_author_users_without_resolver_is_empty(self) -> None:
         out = await commits._resolve_author_users(

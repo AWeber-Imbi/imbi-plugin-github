@@ -403,12 +403,14 @@ ResolveUser = collections.abc.Callable[
 # Process-wide, bounded LRU cache of resolved commit-author identities,
 # keyed by ``(api_base, subject)``.  The subject is GitHub's numeric user
 # id, which is only unique *per host* (github.com id 42 != a GHES id 42),
-# so the resolved API base scopes the key.  Both hits and misses are
-# cached -- a full-history resync of a repo with many external
-# contributors would otherwise re-query the identity store for every
-# commit on every run.  An ``OrderedDict`` gives LRU eviction once the
-# cache exceeds ``_USER_CACHE_MAX`` entries.
-_USER_CACHE: collections.OrderedDict[tuple[str, str], str | None] = (
+# so the resolved API base scopes the key.  Only *successful* resolutions
+# are cached: within a single sync :func:`_resolve_author_users` already
+# de-dupes subjects, and leaving misses uncached means a contributor who
+# links their Imbi identity later is picked up on the next sync instead
+# of being stuck unresolved for the process's lifetime.  An
+# ``OrderedDict`` gives LRU eviction once the cache exceeds
+# ``_USER_CACHE_MAX`` entries.
+_USER_CACHE: collections.OrderedDict[tuple[str, str], str] = (
     collections.OrderedDict()
 )
 _USER_CACHE_MAX = 8192
@@ -420,15 +422,19 @@ async def _resolve_user(
     """Resolve a GitHub user id to an Imbi email, LRU-cached per host.
 
     ``subject`` is the GitHub numeric user id (the identity-plugin
-    subject).  Results -- hits *and* misses -- are memoized under
-    ``(base, subject)`` so each distinct author is resolved at most once
-    across the process's lifetime.
+    subject).  Only successful resolutions are memoized under
+    ``(base, subject)``; a miss is returned but not cached, so a
+    contributor who links their Imbi identity later resolves on a
+    subsequent sync rather than being memoized as unresolved for the
+    process's lifetime.
     """
     key = (base, subject)
     if key in _USER_CACHE:
         _USER_CACHE.move_to_end(key)
         return _USER_CACHE[key]
     email = await resolver(subject)
+    if email is None:
+        return None
     _USER_CACHE[key] = email
     _USER_CACHE.move_to_end(key)
     if len(_USER_CACHE) > _USER_CACHE_MAX:
@@ -458,7 +464,16 @@ async def _resolve_author_users(
             subjects.add(str(gid))
     out: dict[str, str] = {}
     for subject in subjects:
-        email = await _resolve_user(resolver, base, subject)
+        try:
+            email = await _resolve_user(resolver, base, subject)
+        except Exception as exc:  # noqa: BLE001 - attribution is best-effort
+            LOGGER.warning(
+                'github-commit-sync: failed to resolve author %s; '
+                'leaving unattributed: %s',
+                subject,
+                exc,
+            )
+            continue
         if email:
             out[subject] = email
     return out
