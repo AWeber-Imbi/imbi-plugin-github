@@ -1357,6 +1357,43 @@ class SyncCommitsThrottleTestCase(unittest.IsolatedAsyncioTestCase):
                 )
         insert.assert_not_awaited()
 
+    @respx.mock
+    async def test_tags_rate_limited_beyond_cap_is_swallowed(self) -> None:
+        # Mirror of the sync_commits swallow path for the tags webhook:
+        # a reset further out than the cap makes _request raise
+        # PluginRateLimited, which sync_tags swallows (a later push
+        # re-syncs) rather than letting it 5xx the gateway.
+        sha = 't' * 40
+        respx.get(
+            f'https://api.github.com/repos/octo/demo/git/tags/{sha}'
+        ).mock(
+            return_value=httpx.Response(
+                403,
+                headers={
+                    'x-ratelimit-remaining': '0',
+                    'x-ratelimit-reset': str(int(time.time()) + 10_000),
+                },
+            )
+        )
+        push = {
+            'ref': 'refs/tags/v1.2.3',
+            'after': sha,
+            'repository': {
+                'full_name': 'octo/demo',
+                'url': 'https://api.github.com/repos/octo/demo',
+            },
+        }
+        with mock.patch.object(commits.asyncio, 'sleep', new=mock.AsyncMock()):
+            with mock.patch(_INSERT, new=mock.AsyncMock()) as insert:
+                await commits.sync_tags(
+                    ctx=_ctx(),
+                    credentials=_CREDS,
+                    external_identifier='',
+                    action_config=commits.SyncTagsConfig(),
+                    event=_event(push),
+                )
+        insert.assert_not_awaited()
+
 
 class ResolveUserCacheTestCase(unittest.IsolatedAsyncioTestCase):
     """LRU caching of commit-author identity resolution."""
