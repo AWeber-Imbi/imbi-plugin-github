@@ -50,6 +50,7 @@ from imbi_common.json_pointer import JsonPointer
 from imbi_common.models import CommitRecord, TagRecord
 from imbi_common.plugins.base import (
     ActionDescriptor,
+    CheckStatus,
     CredentialField,
     PluginContext,
     PluginManifest,
@@ -534,7 +535,7 @@ def _commit_record(
     ref: str,
     pushed_at: datetime.datetime,
     author_user: str = '',
-    ci_status: str = 'unknown',
+    ci_status: CheckStatus = 'unknown',
 ) -> CommitRecord:
     """Map a GitHub commit object onto a :class:`CommitRecord`.
 
@@ -651,7 +652,7 @@ async def _ci_status(
     owner: str,
     repo: str,
     max_wait: float,
-) -> str:
+) -> CheckStatus:
     """Roll up ``/commits/{sha}/check-runs`` into a ci_status string.
 
     Reuses the deployment plugin's ``/check-runs`` mapping and its 403
@@ -687,7 +688,7 @@ async def _hydrate_ci(
     owner: str,
     repo: str,
     max_wait: float,
-) -> dict[str, str]:
+) -> dict[str, CheckStatus]:
     """Resolve ``ci_status`` for ``shas`` -> ``{sha: status}``.
 
     Probes the head commit first so a 403 (missing scope / Actions
@@ -695,7 +696,7 @@ async def _hydrate_ci(
     the deployment plugin's commit picker.  Shas absent from the returned
     map fall back to ``'unknown'`` at the call site.
     """
-    out: dict[str, str] = {}
+    out: dict[str, CheckStatus] = {}
     if not shas or _checks_disabled(credentials, base, owner, repo):
         return out
     head, *tail = shas
@@ -902,7 +903,7 @@ async def sync_commits(
     before = _resolve(action_config.before_selector, event)
     pushed_at = datetime.datetime.now(datetime.UTC)
     token = await _resolve_bearer(credentials, base, owner, repo)
-    ci_by_sha: dict[str, str] = {}
+    ci_by_sha: dict[str, CheckStatus] = {}
     try:
         async with _client(base, owner, repo, token) as client:
             if isinstance(before, str) and before and before != _ZERO_SHA:

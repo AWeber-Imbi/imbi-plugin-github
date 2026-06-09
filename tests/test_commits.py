@@ -516,6 +516,17 @@ class SyncCommitsCiStatusTestCase(unittest.IsolatedAsyncioTestCase):
         records = await self._run()
         self.assertEqual('unknown', records[0].ci_status)
 
+    @respx.mock
+    async def test_non_403_http_error_degrades_to_unknown(self) -> None:
+        # A non-200, non-403 response (e.g. 500) is not cached as
+        # checks-disabled, so it degrades to 'unknown' per commit.
+        self._mock_compare('c' * 40)
+        respx.get(_check_runs_url('c' * 40)).mock(
+            return_value=httpx.Response(500)
+        )
+        records = await self._run()
+        self.assertEqual('unknown', records[0].ci_status)
+
 
 class SyncTagsTestCase(unittest.IsolatedAsyncioTestCase):
     def _tag_push(self, *, after: str = 't' * 40) -> dict[str, object]:
