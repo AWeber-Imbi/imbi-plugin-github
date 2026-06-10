@@ -1004,7 +1004,7 @@ async def _release_published_for_tag(
     resp = await _request(
         client,
         'GET',
-        f'/releases/tags/{urllib.parse.quote(name)}',
+        f'/releases/tags/{urllib.parse.quote(name, safe="")}',
         max_wait=max_wait,
     )
     if resp.status_code != 200:

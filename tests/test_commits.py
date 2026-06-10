@@ -530,9 +530,11 @@ class SyncCommitsCiStatusTestCase(unittest.IsolatedAsyncioTestCase):
 
 
 class SyncTagsTestCase(unittest.IsolatedAsyncioTestCase):
-    def _tag_push(self, *, after: str = 't' * 40) -> dict[str, object]:
+    def _tag_push(
+        self, *, after: str = 't' * 40, ref: str = 'refs/tags/v1.2.3'
+    ) -> dict[str, object]:
         return {
-            'ref': 'refs/tags/v1.2.3',
+            'ref': ref,
             'after': after,
             'repository': {
                 'full_name': 'octo/demo',
@@ -602,6 +604,40 @@ class SyncTagsTestCase(unittest.IsolatedAsyncioTestCase):
                 action_config=commits.SyncTagsConfig(),
                 event=_event(self._tag_push(after=sha)),
             )
+        _, records = _await_args(insert)
+        self.assertEqual(
+            datetime.datetime.fromisoformat('2026-02-03T04:05:06Z'),
+            records[0].tagged_at,
+        )
+
+    @respx.mock
+    async def test_release_lookup_encodes_slash_in_tag(self) -> None:
+        # A tag like ``release/v1.2.3`` must be encoded as a single
+        # path segment so the GitHub ``/releases/tags/:tag`` route
+        # matches and ``published_at`` is found.
+        sha = 't' * 40
+        respx.get(
+            f'https://api.github.com/repos/octo/demo/git/tags/{sha}'
+        ).mock(return_value=httpx.Response(404))
+        route = respx.get(
+            'https://api.github.com/repos/octo/demo/'
+            'releases/tags/release%2Fv1.2.3'
+        ).mock(
+            return_value=httpx.Response(
+                200, json={'published_at': '2026-02-03T04:05:06Z'}
+            )
+        )
+        with mock.patch(_INSERT, new=mock.AsyncMock()) as insert:
+            await commits.sync_tags(
+                ctx=_ctx(),
+                credentials=_CREDS,
+                external_identifier='',
+                action_config=commits.SyncTagsConfig(),
+                event=_event(
+                    self._tag_push(after=sha, ref='refs/tags/release/v1.2.3')
+                ),
+            )
+        self.assertTrue(route.called)
         _, records = _await_args(insert)
         self.assertEqual(
             datetime.datetime.fromisoformat('2026-02-03T04:05:06Z'),
