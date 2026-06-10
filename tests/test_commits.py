@@ -1,6 +1,7 @@
 """Tests for the GitHub commit / tag history sync webhook plugin."""
 
 import base64
+import datetime
 import time
 import typing
 import unittest
@@ -545,6 +546,13 @@ class SyncTagsTestCase(unittest.IsolatedAsyncioTestCase):
         respx.get(
             f'https://api.github.com/repos/octo/demo/git/tags/{sha}'
         ).mock(return_value=httpx.Response(404))
+        respx.get(
+            f'https://api.github.com/repos/octo/demo/git/commits/{sha}'
+        ).mock(
+            return_value=httpx.Response(
+                200, json={'committer': {'date': '2026-01-15T12:00:00Z'}}
+            )
+        )
         with mock.patch(_INSERT, new=mock.AsyncMock()) as insert:
             await commits.sync_tags(
                 ctx=_ctx(),
@@ -560,6 +568,32 @@ class SyncTagsTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual('v1.2.3', records[0].name)
         self.assertEqual(sha, records[0].sha)
         self.assertEqual('', records[0].message)
+        # Lightweight tags carry no tagger date; the target commit's
+        # committer date stands in so the UI doesn't show sync time.
+        self.assertEqual(
+            datetime.datetime.fromisoformat('2026-01-15T12:00:00Z'),
+            records[0].tagged_at,
+        )
+
+    @respx.mock
+    async def test_lightweight_tag_date_fetch_failure_degrades(self) -> None:
+        sha = 't' * 40
+        respx.get(
+            f'https://api.github.com/repos/octo/demo/git/tags/{sha}'
+        ).mock(return_value=httpx.Response(404))
+        respx.get(
+            f'https://api.github.com/repos/octo/demo/git/commits/{sha}'
+        ).mock(return_value=httpx.Response(500))
+        with mock.patch(_INSERT, new=mock.AsyncMock()) as insert:
+            await commits.sync_tags(
+                ctx=_ctx(),
+                credentials=_CREDS,
+                external_identifier='',
+                action_config=commits.SyncTagsConfig(),
+                event=_event(self._tag_push(after=sha)),
+            )
+        _, records = _await_args(insert)
+        self.assertIsNone(records[0].tagged_at)
 
     @respx.mock
     async def test_annotated_tag_metadata(self) -> None:
@@ -598,6 +632,11 @@ class SyncTagsTestCase(unittest.IsolatedAsyncioTestCase):
         respx.get(
             f'https://api.github.com/repos/octo/demo/git/tags/{sha}'
         ).mock(return_value=httpx.Response(404))
+        respx.get(url__regex=r'.*/git/commits/\w+$').mock(
+            return_value=httpx.Response(
+                200, json={'committer': {'date': '2026-01-15T12:00:00Z'}}
+            )
+        )
         respx.get(
             'https://api.github.com/repos/octo/demo/git/matching-refs/tags'
         ).mock(
@@ -641,6 +680,11 @@ class SyncTagsTestCase(unittest.IsolatedAsyncioTestCase):
         respx.get(
             f'https://api.github.com/repos/octo/demo/git/tags/{sha}'
         ).mock(return_value=httpx.Response(404))
+        respx.get(url__regex=r'.*/git/commits/\w+$').mock(
+            return_value=httpx.Response(
+                200, json={'committer': {'date': '2026-01-15T12:00:00Z'}}
+            )
+        )
         url = 'https://api.github.com/repos/octo/demo/git/matching-refs/tags'
         respx.get(url).mock(
             side_effect=[
@@ -1010,6 +1054,11 @@ class SyncAllHistoryTestCase(unittest.IsolatedAsyncioTestCase):
         commit_route = respx.get(f'{self._REPO}/commits').mock(
             return_value=httpx.Response(
                 200, json=[_commit('c' * 40), _commit('d' * 40)]
+            )
+        )
+        respx.get(url__regex=r'.*/git/commits/\w+$').mock(
+            return_value=httpx.Response(
+                200, json={'committer': {'date': '2026-01-15T12:00:00Z'}}
             )
         )
         respx.get(f'{self._REPO}/git/matching-refs/tags').mock(

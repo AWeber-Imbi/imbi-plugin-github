@@ -977,6 +977,26 @@ async def _annotated_tag(
     return typing.cast('dict[str, typing.Any]', resp.json())
 
 
+async def _commit_date(
+    client: httpx.AsyncClient, sha: str, *, max_wait: float
+) -> datetime.datetime | None:
+    """Committer date of commit *sha*, ``None`` when unavailable.
+
+    Lightweight tags carry no tagger date, so their target commit's
+    date stands in for ``tagged_at`` — otherwise the ClickHouse row
+    falls back to ``recorded_at`` (sync time) and every release in the
+    UI reads "just now" after a full reconcile.
+    """
+    resp = await _request(
+        client, 'GET', f'/git/commits/{sha}', max_wait=max_wait
+    )
+    if resp.status_code != 200:
+        return None
+    data = typing.cast('dict[str, typing.Any]', resp.json())
+    committer: dict[str, typing.Any] = data.get('committer') or {}
+    return _parse_iso(committer.get('date'))
+
+
 def _web_base(api_base: str) -> str:
     """Map a REST API base to the web host (inverse of the routing table).
 
@@ -1008,9 +1028,16 @@ def _tag_record(
     sha: str,
     annotated: dict[str, typing.Any] | None = None,
     url: str = '',
+    lightweight_tagged_at: datetime.datetime | None = None,
 ) -> TagRecord:
     if annotated is None:
-        return TagRecord(project_id=project_id, name=name, sha=sha, url=url)
+        return TagRecord(
+            project_id=project_id,
+            name=name,
+            sha=sha,
+            url=url,
+            tagged_at=lightweight_tagged_at,
+        )
     tagger: dict[str, typing.Any] = annotated.get('tagger') or {}
     return TagRecord(
         project_id=project_id,
@@ -1066,6 +1093,11 @@ async def _reconcile_tags(
                     sha=sha,
                     annotated=annotated,
                     url=_tag_web_url(client, name),
+                    lightweight_tagged_at=(
+                        await _commit_date(client, sha, max_wait=max_wait)
+                        if annotated is None
+                        else None
+                    ),
                 )
             )
         next_url = _next_page_url(resp.headers.get('link'))
@@ -1117,6 +1149,13 @@ async def sync_tags(
                     sha=after,
                     annotated=annotated,
                     url=_tag_web_url(client, name),
+                    lightweight_tagged_at=(
+                        await _commit_date(
+                            client, after, max_wait=_WEBHOOK_MAX_WAIT_SECONDS
+                        )
+                        if annotated is None
+                        else None
+                    ),
                 )
             ]
             if action_config.reconcile_all:
