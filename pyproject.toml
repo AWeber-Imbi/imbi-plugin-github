@@ -28,6 +28,9 @@ github-deployment = "imbi_plugin_github.deployment:GitHubDeploymentPlugin"
 github-lifecycle = "imbi_plugin_github.lifecycle:GitHubLifecyclePlugin"
 github-commit-sync = "imbi_plugin_github.commits:GitHubCommitSyncPlugin"
 github-pr-sync = "imbi_plugin_github.pull_requests:GitHubPRSyncPlugin"
+github-doctor = "imbi_plugin_github.doctor:GitHubDoctorPlugin"
+github-doctor-ec = "imbi_plugin_github.doctor:GitHubEnterpriseCloudDoctorPlugin"
+github-doctor-es = "imbi_plugin_github.doctor:GitHubEnterpriseServerDoctorPlugin"
 
 [dependency-groups]
 dev = [
