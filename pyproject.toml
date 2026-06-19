@@ -16,7 +16,7 @@ classifiers = [
 ]
 dependencies = [
   "httpx>=0.27",
-  "imbi-common[databases]==2.11.5",
+  "imbi-common[databases]==2.11.6",
   "pydantic>=2",
   "pyjwt[crypto]>=2.8",
 ]
@@ -36,7 +36,7 @@ github-doctor-es = "imbi_plugin_github.doctor:GitHubEnterpriseServerDoctorPlugin
 dev = [
   "basedpyright",
   "coverage[toml]",
-  "imbi-common[server,databases]==2.11.5",
+  "imbi-common[server,databases]==2.11.6",
   "pre-commit",
   "pytest",
   "pytest-asyncio",
@@ -126,11 +126,13 @@ exclude-newer = "7 days"
 exclude-newer-package = { "clickhouse-connect" = false, "imbi-common" = false, "imbi-plugin-aws" = false, "imbi-plugin-github" = false, "imbi-plugin-logzio" = false, "imbi-plugin-oidc" = false, "imbi-plugin-pagerduty" = false, "imbi-plugin-sentry" = false, "imbi-plugin-sonarqube" = false }
 
 [tool.uv.sources]
-# Temporary: track imbi-common main so the consolidation lands before
-# imbi-common is released. The lockstep release flow restores the
-# pinned PyPI version (==X) here. imbi-common is a public repo, so CI
-# clones it anonymously (no token needed).
-imbi-common = { git = "https://github.com/AWeber-Imbi/imbi-common.git", branch = "main" }
+# TEMP (doctor-remediation): consume the local imbi-common work tree
+# (feature/doctor-remediation = main + the remediation contract) until
+# imbi-common publishes a release carrying BOTH the plugin-consolidation
+# ConnectionPlugin type and the remediation contract. Restore the pinned
+# PyPI version (==X) and remove this block before the PR. imbi-common is
+# a public repo, so CI clones it anonymously (no token needed).
+imbi-common = { path = "../imbi-common", editable = true }
 
 [[tool.uv.index]]
 url = "https://pypi.org/simple"

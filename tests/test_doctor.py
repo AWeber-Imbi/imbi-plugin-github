@@ -5,8 +5,14 @@ import unittest
 import httpx
 import respx
 from imbi_common.plugins.base import PluginContext, ServiceConnection
+from imbi_common.plugins.errors import (
+    PluginAuthenticationFailed,
+    PluginRemediationNotSupported,
+)
 
 from imbi_plugin_github.doctor import (
+    _REPAIR_EDGE,
+    _REPAIR_GITHUB_LINK,
     GitHubDoctorPlugin,
     GitHubEnterpriseCloudDoctorPlugin,
     GitHubEnterpriseServerDoctorPlugin,
@@ -325,6 +331,126 @@ class AnalyzeTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(by['canonical-url'].status, 'pass')  # type: ignore[attr-defined]
         # No canonical URL on the edge → shape check should warn
         self.assertEqual(by['canonical-url-shape'].status, 'warn')  # type: ignore[attr-defined]
+
+
+class RemediationOfferTestCase(unittest.IsolatedAsyncioTestCase):
+    @respx.mock
+    async def test_fail_findings_carry_offers(self) -> None:
+        respx.get(_CANONICAL).mock(
+            return_value=httpx.Response(200, json={**_REPO_PAYLOAD, 'id': 999})
+        )
+        plugin = GitHubEnterpriseCloudDoctorPlugin()
+        results = await plugin.analyze(_ctx(), _CREDS)
+        by = _by_slug(results)
+        offer = by['identifier-match'].remediation  # type: ignore[attr-defined]
+        self.assertIsNotNone(offer)
+        self.assertEqual(offer.id, _REPAIR_EDGE)
+
+    @respx.mock
+    async def test_passing_findings_have_no_offer(self) -> None:
+        respx.get(_CANONICAL).mock(
+            return_value=httpx.Response(200, json=_REPO_PAYLOAD)
+        )
+        plugin = GitHubEnterpriseCloudDoctorPlugin()
+        results = await plugin.analyze(_ctx(), _CREDS)
+        for item in results:
+            self.assertIsNone(item.remediation)  # type: ignore[attr-defined]
+
+
+class RemediateTestCase(unittest.IsolatedAsyncioTestCase):
+    async def test_unknown_id_raises(self) -> None:
+        plugin = GitHubEnterpriseCloudDoctorPlugin()
+        with self.assertRaises(PluginRemediationNotSupported):
+            await plugin.remediate(_ctx(), _CREDS, 'bogus')
+
+    async def test_no_connection_failed(self) -> None:
+        plugin = GitHubEnterpriseCloudDoctorPlugin()
+        result = await plugin.remediate(
+            _ctx(connections=[]), _CREDS, _REPAIR_EDGE
+        )
+        self.assertEqual(result.status, 'failed')
+
+    @respx.mock
+    async def test_edge_repair_emits_service_writeback(self) -> None:
+        respx.get(_CANONICAL).mock(
+            return_value=httpx.Response(200, json={**_REPO_PAYLOAD, 'id': 999})
+        )
+        plugin = GitHubEnterpriseCloudDoctorPlugin()
+        ctx = _ctx(
+            connections=[
+                ServiceConnection(
+                    service_slug=_TPS_SLUG,
+                    identifier='134741',
+                    canonical_url=_CANONICAL,
+                )
+            ]
+        )
+        result = await plugin.remediate(ctx, _CREDS, _REPAIR_EDGE)
+        self.assertEqual(result.status, 'fixed')
+        self.assertIsNotNone(ctx.service_writeback)
+        assert ctx.service_writeback is not None
+        self.assertEqual(ctx.service_writeback.identifier, '999')
+        self.assertEqual(
+            ctx.service_writeback.canonical_url,
+            f'{_API_BASE}/repositories/999',
+        )
+        self.assertEqual(
+            ctx.service_writeback.dashboard_links, {_TPS_SLUG: _DASHBOARD}
+        )
+
+    @respx.mock
+    async def test_edge_repair_noop_when_correct(self) -> None:
+        respx.get(_CANONICAL).mock(
+            return_value=httpx.Response(200, json=_REPO_PAYLOAD)
+        )
+        plugin = GitHubEnterpriseCloudDoctorPlugin()
+        ctx = _ctx()
+        result = await plugin.remediate(ctx, _CREDS, _REPAIR_EDGE)
+        self.assertEqual(result.status, 'noop')
+        self.assertIsNone(ctx.service_writeback)
+
+    @respx.mock
+    async def test_github_link_repair_emits_link_writeback(self) -> None:
+        respx.get(_CANONICAL).mock(
+            return_value=httpx.Response(200, json=_REPO_PAYLOAD)
+        )
+        plugin = GitHubEnterpriseCloudDoctorPlugin()
+        ctx = _ctx(
+            links={
+                _TPS_SLUG: _DASHBOARD,
+                'github-repository': f'https://{_HOST}/aweber/stale',
+            }
+        )
+        result = await plugin.remediate(ctx, _CREDS, _REPAIR_GITHUB_LINK)
+        self.assertEqual(result.status, 'fixed')
+        assert ctx.link_writeback is not None
+        self.assertEqual(ctx.link_writeback.link_key, 'github-repository')
+        self.assertEqual(ctx.link_writeback.new_url, _DASHBOARD)
+
+    @respx.mock
+    async def test_github_link_repair_noop_when_correct(self) -> None:
+        respx.get(_CANONICAL).mock(
+            return_value=httpx.Response(200, json=_REPO_PAYLOAD)
+        )
+        plugin = GitHubEnterpriseCloudDoctorPlugin()
+        ctx = _ctx()
+        result = await plugin.remediate(ctx, _CREDS, _REPAIR_GITHUB_LINK)
+        self.assertEqual(result.status, 'noop')
+        self.assertIsNone(ctx.link_writeback)
+
+    @respx.mock
+    async def test_401_propagates_for_identity_retry(self) -> None:
+        respx.get(_CANONICAL).mock(return_value=httpx.Response(401))
+        plugin = GitHubEnterpriseCloudDoctorPlugin()
+        with self.assertRaises(PluginAuthenticationFailed):
+            await plugin.remediate(_ctx(), _CREDS, _REPAIR_EDGE)
+
+    @respx.mock
+    async def test_non_success_failed(self) -> None:
+        respx.get(_CANONICAL).mock(return_value=httpx.Response(404))
+        plugin = GitHubEnterpriseCloudDoctorPlugin()
+        result = await plugin.remediate(_ctx(), _CREDS, _REPAIR_EDGE)
+        self.assertEqual(result.status, 'failed')
 
 
 if __name__ == '__main__':

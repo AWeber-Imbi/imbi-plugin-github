@@ -22,11 +22,16 @@ from imbi_common.plugins.base import (
     AnalysisResultItem,
     AnalysisResultStatus,
     CredentialField,
+    LinkWriteback,
     PluginContext,
     PluginManifest,
     PluginOption,
+    RemediationOffer,
+    RemediationResult,
     ServiceConnection,
+    ServiceWriteback,
 )
+from imbi_common.plugins.errors import PluginAuthenticationFailed
 
 from imbi_plugin_github._hosts import (
     host_to_api_base,
@@ -40,18 +45,43 @@ _TIMEOUT = 15.0
 # https://api.{host}/repositories/{integer_id}
 _REPO_ID_RE = re.compile(r'.*/repositories/(\d+)$')
 
+# Remediation ids round-tripped through ``RemediationOffer.id``.  Every
+# edge-shaped discrepancy (identifier, canonical URL shape, dashboard
+# link) is repaired by one ``ServiceWriteback`` so they share an id; the
+# legacy ``github-repository`` link is a separate ``LinkWriteback``.
+_REPAIR_EDGE = 'repair-edge'
+_REPAIR_GITHUB_LINK = 'repair-github-link'
+
+
+async def _raise_on_401(response: httpx.Response) -> None:
+    """Convert a 401 from GitHub into :class:`PluginAuthenticationFailed`.
+
+    Mirrors the deployment / lifecycle plugins' hook so the host's retry
+    layer can refresh the actor's identity once and retry remediation.
+    Only installed on the ``remediate`` client; ``analyze`` deliberately
+    treats 401 softly (warn) because diagnosis must not hard-fail.
+    """
+    if response.status_code != 401:
+        return
+    await response.aread()
+    raise PluginAuthenticationFailed(
+        f'GitHub 401 from {response.request.url}: {response.text}'
+    )
+
 
 def _item(
     slug: str,
     title: str,
     status: AnalysisResultStatus,
     description: str,
+    remediation: RemediationOffer | None = None,
 ) -> AnalysisResultItem:
     return AnalysisResultItem(
         slug=slug,
         title=title,
         status=status,
         description=description,
+        remediation=remediation,
     )
 
 
@@ -257,6 +287,10 @@ class _GitHubDoctorBase(AnalysisPlugin):
                     f'EXISTS_IN identifier {connection.identifier!r} cannot '
                     'be parsed as an integer. GitHub repository IDs are '
                     'always integers; the stored value is corrupt.',
+                    RemediationOffer(
+                        id=_REPAIR_EDGE,
+                        label='Repair the EXISTS_IN edge from GitHub',
+                    ),
                 )
             )
         else:
@@ -290,7 +324,11 @@ class _GitHubDoctorBase(AnalysisPlugin):
                     'fail',
                     f'EXISTS_IN identifier {connection.identifier!r} does not '
                     f'match the GitHub API id {api_id!r}. '
-                    'Re-run the lifecycle plugin to repair the edge.',
+                    'Use the Fix action to repair the edge from GitHub.',
+                    RemediationOffer(
+                        id=_REPAIR_EDGE,
+                        label='Repair the EXISTS_IN edge from GitHub',
+                    ),
                 )
             )
 
@@ -317,7 +355,11 @@ class _GitHubDoctorBase(AnalysisPlugin):
                         f'Canonical URL {connection.canonical_url!r} does not '
                         f'follow the expected '
                         f'{api_base}/repositories/{{id}} shape. '
-                        'Re-run the lifecycle plugin to repair the edge.',
+                        'Use the Fix action to repair the edge from GitHub.',
+                        RemediationOffer(
+                            id=_REPAIR_EDGE,
+                            label='Repair the EXISTS_IN edge from GitHub',
+                        ),
                     )
                 )
         else:
@@ -341,7 +383,11 @@ class _GitHubDoctorBase(AnalysisPlugin):
                     'Dashboard URL match',
                     'warn',
                     f'No dashboard link stored for service {slug!r}. '
-                    'Run the lifecycle plugin to set the dashboard link.',
+                    'Use the Fix action to set it from GitHub.',
+                    RemediationOffer(
+                        id=_REPAIR_EDGE,
+                        label='Set the dashboard link from GitHub',
+                    ),
                 )
             )
         elif tps_link == html_url:
@@ -362,7 +408,11 @@ class _GitHubDoctorBase(AnalysisPlugin):
                     'fail',
                     f'Dashboard link {tps_link!r} does not match the GitHub '
                     f'html_url {html_url!r}. '
-                    'Update the project link or re-run the lifecycle plugin.',
+                    'Use the Fix action to update it from GitHub.',
+                    RemediationOffer(
+                        id=_REPAIR_EDGE,
+                        label='Set the dashboard link from GitHub',
+                    ),
                 )
             )
 
@@ -375,8 +425,11 @@ class _GitHubDoctorBase(AnalysisPlugin):
                     'github-repository link match',
                     'warn',
                     'No github-repository link stored on the project. '
-                    'Run the lifecycle plugin (or add the link manually) '
-                    'to populate it.',
+                    'Use the Fix action to set it from GitHub.',
+                    RemediationOffer(
+                        id=_REPAIR_GITHUB_LINK,
+                        label='Set the github-repository link from GitHub',
+                    ),
                 )
             )
         elif gh_link == html_url:
@@ -397,11 +450,137 @@ class _GitHubDoctorBase(AnalysisPlugin):
                     'fail',
                     f'github-repository link {gh_link!r} does not match '
                     f'the GitHub html_url {html_url!r}. '
-                    'Update the project link.',
+                    'Use the Fix action to update it from GitHub.',
+                    RemediationOffer(
+                        id=_REPAIR_GITHUB_LINK,
+                        label='Set the github-repository link from GitHub',
+                    ),
                 )
             )
 
         return results
+
+    async def remediate(
+        self,
+        ctx: PluginContext,
+        credentials: dict[str, str],
+        remediation_id: str,
+    ) -> RemediationResult:
+        """Repair the EXISTS_IN edge or github-repository link from GitHub.
+
+        Re-fetches the repository (the live source of truth) and emits a
+        ``ServiceWriteback`` / ``LinkWriteback`` on ``ctx`` for the host
+        to persist.  Idempotent: returns ``noop`` when Imbi already
+        matches GitHub.  A 401 propagates as ``PluginAuthenticationFailed``
+        so the host can refresh the actor's identity and retry once.
+        """
+        if remediation_id not in (_REPAIR_EDGE, _REPAIR_GITHUB_LINK):
+            return await super().remediate(ctx, credentials, remediation_id)
+
+        host = self._resolve_host(ctx.assignment_options)
+        api_base = host_to_api_base(host)
+        slug = ctx.third_party_service_slug
+        connection = (
+            next(
+                (c for c in ctx.service_connections if c.service_slug == slug),
+                None,
+            )
+            if slug
+            else None
+        )
+        if slug is None or connection is None:
+            return RemediationResult(
+                status='failed',
+                message=(
+                    'No EXISTS_IN edge for this service — nothing to '
+                    'repair. Run the lifecycle plugin to create it.'
+                ),
+            )
+
+        fetch_url = _repo_fetch_url(connection, ctx, host, api_base)
+        if fetch_url is None:
+            return RemediationResult(
+                status='failed',
+                message=(
+                    'Cannot resolve the GitHub repository URL from the '
+                    'EXISTS_IN edge or project links.'
+                ),
+            )
+
+        token = credentials.get('access_token') or credentials.get('token')
+        headers: dict[str, str] = {}
+        if token:
+            headers['Authorization'] = f'Bearer {token}'
+
+        # The 401 hook raises PluginAuthenticationFailed so the host's
+        # identity-retry layer can refresh and retry once.
+        try:
+            async with httpx.AsyncClient(
+                headers=headers,
+                timeout=_TIMEOUT,
+                event_hooks={'response': [_raise_on_401]},
+            ) as client:
+                resp = await client.get(fetch_url)
+        except httpx.TransportError as exc:
+            return RemediationResult(
+                status='failed',
+                message=f'Transport error fetching {fetch_url!r}: {exc}',
+            )
+        if not resp.is_success:
+            return RemediationResult(
+                status='failed',
+                message=f'HTTP {resp.status_code} fetching {fetch_url!r}.',
+            )
+
+        body = typing.cast(dict[str, typing.Any], resp.json())
+        api_id = body.get('id')
+        html_url = str(body.get('html_url', ''))
+        if not isinstance(api_id, int):
+            return RemediationResult(
+                status='failed',
+                message='GitHub response did not include an integer id.',
+            )
+
+        if remediation_id == _REPAIR_GITHUB_LINK:
+            if ctx.project_links.get('github-repository') == html_url:
+                return RemediationResult(
+                    status='noop',
+                    message='github-repository link already matches GitHub.',
+                )
+            ctx.link_writeback = LinkWriteback(
+                link_key='github-repository',
+                new_url=html_url,
+            )
+            return RemediationResult(
+                status='fixed',
+                message=f'Set github-repository link to {html_url}.',
+            )
+
+        # _REPAIR_EDGE: rewrite identifier + canonical URL + dashboard
+        # link in one ServiceWriteback.
+        desired_canonical = f'{api_base}/repositories/{api_id}'
+        already_correct = (
+            connection.identifier == str(api_id)
+            and connection.canonical_url == desired_canonical
+            and ctx.project_links.get(slug) == html_url
+        )
+        if already_correct:
+            return RemediationResult(
+                status='noop',
+                message='EXISTS_IN edge already matches GitHub.',
+            )
+        ctx.service_writeback = ServiceWriteback(
+            identifier=str(api_id),
+            canonical_url=desired_canonical,
+            dashboard_links={slug: html_url},
+        )
+        return RemediationResult(
+            status='fixed',
+            message=(
+                f'Repaired the EXISTS_IN edge for {slug!r} '
+                f'(identifier={api_id}).'
+            ),
+        )
 
 
 def _body_unavailable_items() -> list[AnalysisResultItem]:
