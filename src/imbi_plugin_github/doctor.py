@@ -5,14 +5,16 @@ identifier is an integer, canonical URL follows the /repositories/{id} shape
 that the lifecycle plugin writes, dashboard link matches the API html_url, and
 the legacy github-repository link matches as well.
 
-Three concrete subclasses cover github.com, GHEC tenants, and GHES appliances,
-following the same base/subclass/host-flavor pattern as every other plugin
-family in this package.
+A single host-agnostic plugin covers github.com, GHEC tenants, and GHES
+appliances: the GitHub host is resolved from the ``github-connection`` plugin
+on the same service, mirroring every other behavioral plugin in this package.
+The shared App/PAT credentials also live on that connection plugin, so the
+host supplies them through ``credentials`` (with the acting user's identity
+token preferred); the doctor declares no credential of its own.
 """
 
 from __future__ import annotations
 
-import abc
 import re
 import typing
 
@@ -21,11 +23,9 @@ from imbi_common.plugins.base import (
     AnalysisPlugin,
     AnalysisResultItem,
     AnalysisResultStatus,
-    CredentialField,
     LinkWriteback,
     PluginContext,
     PluginManifest,
-    PluginOption,
     RemediationOffer,
     RemediationResult,
     ServiceConnection,
@@ -35,8 +35,7 @@ from imbi_common.plugins.errors import PluginAuthenticationFailed
 
 from imbi_plugin_github._hosts import (
     host_to_api_base,
-    normalize_host,
-    require_ghec_tenant_host,
+    resolve_connection_host,
 )
 from imbi_plugin_github._repos import derive_owner_repo_from_links
 
@@ -110,16 +109,26 @@ def _repo_fetch_url(
     return None
 
 
-class _GitHubDoctorBase(AnalysisPlugin):
-    """Abstract base for the GitHub doctor plugin family.
+class GitHubDoctorPlugin(AnalysisPlugin):
+    """Host-agnostic GitHub project-doctor analysis plugin.
 
-    Subclasses override ``_resolve_host`` to return the target GitHub host;
-    all analysis logic lives here.
+    Resolves the GitHub host from the ``github-connection`` plugin on the
+    same service (github.com / GHEC tenant / GHES appliance) and validates
+    the ``EXISTS_IN`` edge against the live GitHub API.
     """
 
-    @classmethod
-    @abc.abstractmethod
-    def _resolve_host(cls, options: dict[str, typing.Any]) -> str: ...
+    manifest = PluginManifest(
+        slug='github-doctor',
+        name='GitHub Doctor',
+        description=(
+            'Validates the EXISTS_IN edge against the live GitHub API: '
+            'checks the identifier, canonical URL shape, dashboard link, '
+            'and github-repository link. The GitHub host and shared '
+            'App/PAT credentials are resolved from the github-connection '
+            'plugin on the same service.'
+        ),
+        plugin_type='analysis',
+    )
 
     async def analyze(  # noqa: C901 — flat sequence of independent checks
         self,
@@ -128,7 +137,12 @@ class _GitHubDoctorBase(AnalysisPlugin):
     ) -> list[AnalysisResultItem]:
         results: list[AnalysisResultItem] = []
 
-        host = self._resolve_host(ctx.assignment_options)
+        try:
+            host = resolve_connection_host(
+                ctx.service_plugins, 'github-doctor'
+            )
+        except ValueError as exc:
+            return [_item('connection', 'GitHub connection', 'warn', str(exc))]
         api_base = host_to_api_base(host)
 
         # Step 1: locate the EXISTS_IN connection for this service.
@@ -477,7 +491,12 @@ class _GitHubDoctorBase(AnalysisPlugin):
         if remediation_id not in (_REPAIR_EDGE, _REPAIR_GITHUB_LINK):
             return await super().remediate(ctx, credentials, remediation_id)
 
-        host = self._resolve_host(ctx.assignment_options)
+        try:
+            host = resolve_connection_host(
+                ctx.service_plugins, 'github-doctor'
+            )
+        except ValueError as exc:
+            return RemediationResult(status='failed', message=str(exc))
         api_base = host_to_api_base(host)
         slug = ctx.third_party_service_slug
         connection = (
@@ -617,93 +636,3 @@ def _body_unavailable_items() -> list[AnalysisResultItem]:
             'Cannot verify github-repository link: repository fetch failed.',
         ),
     ]
-
-
-_COMMON_CREDENTIALS: list[CredentialField] = [
-    CredentialField(
-        name='access_token',
-        label='Access token',
-        description=(
-            'Personal access token or server-side token with at minimum '
-            'repo scope.  Optional — omit for public repositories.'
-        ),
-        required=False,
-    ),
-]
-
-
-class GitHubDoctorPlugin(_GitHubDoctorBase):
-    manifest = PluginManifest(
-        slug='github-doctor',
-        name='GitHub Doctor',
-        description=(
-            'Validates the EXISTS_IN edge for github.com: checks the '
-            'identifier, canonical URL shape, dashboard link, and '
-            'github-repository link against the live GitHub API.'
-        ),
-        plugin_type='analysis',
-        credentials=_COMMON_CREDENTIALS,
-    )
-
-    @classmethod
-    def _resolve_host(cls, options: dict[str, typing.Any]) -> str:
-        del options
-        return 'github.com'
-
-
-class GitHubEnterpriseCloudDoctorPlugin(_GitHubDoctorBase):
-    manifest = PluginManifest(
-        slug='github-doctor-ec',
-        name='GitHub Enterprise Cloud Doctor',
-        description=(
-            'Validates the EXISTS_IN edge for a GHEC tenant (*.ghe.com): '
-            'checks the identifier, canonical URL shape, dashboard link, '
-            'and github-repository link against the live GitHub Enterprise '
-            'Cloud API.'
-        ),
-        plugin_type='analysis',
-        options=[
-            PluginOption(
-                name='host',
-                label='GHEC tenant host',
-                description='e.g. tenant.ghe.com',
-                type='string',
-                required=True,
-            ),
-        ],
-        credentials=_COMMON_CREDENTIALS,
-    )
-
-    @classmethod
-    def _resolve_host(cls, options: dict[str, typing.Any]) -> str:
-        return require_ghec_tenant_host(
-            normalize_host(options.get('host'), 'GHEC doctor plugin'),
-            'GHEC doctor plugin',
-        )
-
-
-class GitHubEnterpriseServerDoctorPlugin(_GitHubDoctorBase):
-    manifest = PluginManifest(
-        slug='github-doctor-es',
-        name='GitHub Enterprise Server Doctor',
-        description=(
-            'Validates the EXISTS_IN edge for a GHES appliance: checks '
-            'the identifier, canonical URL shape, dashboard link, and '
-            'github-repository link against the live GitHub Enterprise '
-            'Server API.'
-        ),
-        plugin_type='analysis',
-        options=[
-            PluginOption(
-                name='host',
-                label='GHES host',
-                type='string',
-                required=True,
-            ),
-        ],
-        credentials=_COMMON_CREDENTIALS,
-    )
-
-    @classmethod
-    def _resolve_host(cls, options: dict[str, typing.Any]) -> str:
-        return normalize_host(options.get('host'), 'GHES doctor plugin')

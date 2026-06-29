@@ -4,7 +4,11 @@ import unittest
 
 import httpx
 import respx
-from imbi_common.plugins.base import PluginContext, ServiceConnection
+from imbi_common.plugins.base import (
+    PluginContext,
+    ServiceConnection,
+    ServicePlugin,
+)
 from imbi_common.plugins.errors import (
     PluginAuthenticationFailed,
     PluginRemediationNotSupported,
@@ -14,8 +18,6 @@ from imbi_plugin_github.doctor import (
     _REPAIR_EDGE,
     _REPAIR_GITHUB_LINK,
     GitHubDoctorPlugin,
-    GitHubEnterpriseCloudDoctorPlugin,
-    GitHubEnterpriseServerDoctorPlugin,
 )
 
 _HOST = 'aweber.ghe.com'
@@ -28,12 +30,20 @@ _TPS_SLUG = 'aweber-github'
 _CREDS = {'access_token': 'gho_test'}
 
 
+def _connection() -> ServicePlugin:
+    """The github-connection sibling the doctor resolves its host from."""
+    return ServicePlugin(
+        slug='github-connection',
+        options={'flavor': 'ghec', 'host': _HOST},
+    )
+
+
 def _ctx(
     *,
     service_slug: str | None = _TPS_SLUG,
     connections: list[ServiceConnection] | None = None,
     links: dict[str, str] | None = None,
-    options: dict[str, object] | None = None,
+    service_plugins: list[ServicePlugin] | None = None,
 ) -> PluginContext:
     if connections is None:
         connections = [
@@ -54,7 +64,9 @@ def _ctx(
         third_party_service_slug=service_slug,
         service_connections=connections,
         project_links=links if links is not None else default_links,
-        assignment_options=options or {'host': _HOST},
+        service_plugins=(
+            service_plugins if service_plugins is not None else [_connection()]
+        ),
     )
 
 
@@ -64,35 +76,39 @@ def _by_slug(items: object) -> dict[str, object]:
 
 class ManifestTestCase(unittest.TestCase):
     def test_manifest(self) -> None:
-        manifest = GitHubEnterpriseCloudDoctorPlugin.manifest
-        self.assertEqual(manifest.slug, 'github-doctor-ec')
-        self.assertEqual(manifest.plugin_type, 'analysis')
-        self.assertFalse(manifest.credentials[0].required)
-
-    def test_ghes_manifest(self) -> None:
-        manifest = GitHubEnterpriseServerDoctorPlugin.manifest
-        self.assertEqual(manifest.slug, 'github-doctor-es')
-        self.assertEqual(manifest.plugin_type, 'analysis')
-
-    def test_github_com_manifest(self) -> None:
         manifest = GitHubDoctorPlugin.manifest
         self.assertEqual(manifest.slug, 'github-doctor')
         self.assertEqual(manifest.plugin_type, 'analysis')
 
+    def test_declares_no_options_or_credentials(self) -> None:
+        # Host and shared App/PAT credentials come from the
+        # github-connection plugin, not the doctor's own assignment.
+        manifest = GitHubDoctorPlugin.manifest
+        self.assertEqual(manifest.options, [])
+        self.assertEqual(manifest.credentials, [])
+
 
 class AnalyzeTestCase(unittest.IsolatedAsyncioTestCase):
     async def test_warns_without_service_binding(self) -> None:
-        plugin = GitHubEnterpriseCloudDoctorPlugin()
+        plugin = GitHubDoctorPlugin()
         results = await plugin.analyze(_ctx(service_slug=None), {})
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].slug, 'exists-in')
         self.assertEqual(results[0].status, 'warn')
 
     async def test_warns_when_no_connection(self) -> None:
-        plugin = GitHubEnterpriseCloudDoctorPlugin()
+        plugin = GitHubDoctorPlugin()
         results = await plugin.analyze(_ctx(connections=[]), {})
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].slug, 'exists-in')
+        self.assertEqual(results[0].status, 'warn')
+
+    async def test_warns_when_no_github_connection_plugin(self) -> None:
+        # Without a github-connection sibling the host cannot be resolved.
+        plugin = GitHubDoctorPlugin()
+        results = await plugin.analyze(_ctx(service_plugins=[]), _CREDS)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].slug, 'connection')
         self.assertEqual(results[0].status, 'warn')
 
     @respx.mock
@@ -100,7 +116,7 @@ class AnalyzeTestCase(unittest.IsolatedAsyncioTestCase):
         respx.get(_CANONICAL).mock(
             return_value=httpx.Response(200, json=_REPO_PAYLOAD)
         )
-        plugin = GitHubEnterpriseCloudDoctorPlugin()
+        plugin = GitHubDoctorPlugin()
         results = await plugin.analyze(_ctx(), _CREDS)
         by = _by_slug(results)
         self.assertEqual(len(results), 7)
@@ -117,7 +133,7 @@ class AnalyzeTestCase(unittest.IsolatedAsyncioTestCase):
         respx.get(_CANONICAL).mock(
             return_value=httpx.Response(200, json=_REPO_PAYLOAD)
         )
-        plugin = GitHubEnterpriseCloudDoctorPlugin()
+        plugin = GitHubDoctorPlugin()
         results = await plugin.analyze(
             _ctx(
                 connections=[
@@ -137,7 +153,7 @@ class AnalyzeTestCase(unittest.IsolatedAsyncioTestCase):
         respx.get(_CANONICAL).mock(
             return_value=httpx.Response(200, json={**_REPO_PAYLOAD, 'id': 999})
         )
-        plugin = GitHubEnterpriseCloudDoctorPlugin()
+        plugin = GitHubDoctorPlugin()
         results = await plugin.analyze(_ctx(), _CREDS)
         self.assertEqual(_by_slug(results)['identifier-match'].status, 'fail')  # type: ignore[attr-defined]
 
@@ -148,7 +164,7 @@ class AnalyzeTestCase(unittest.IsolatedAsyncioTestCase):
         respx.get(bad_canonical).mock(
             return_value=httpx.Response(200, json=_REPO_PAYLOAD)
         )
-        plugin = GitHubEnterpriseCloudDoctorPlugin()
+        plugin = GitHubDoctorPlugin()
         results = await plugin.analyze(
             _ctx(
                 connections=[
@@ -173,7 +189,7 @@ class AnalyzeTestCase(unittest.IsolatedAsyncioTestCase):
         respx.get(wrong_host_canonical).mock(
             return_value=httpx.Response(200, json=_REPO_PAYLOAD)
         )
-        plugin = GitHubEnterpriseCloudDoctorPlugin()
+        plugin = GitHubDoctorPlugin()
         results = await plugin.analyze(
             _ctx(
                 connections=[
@@ -196,7 +212,7 @@ class AnalyzeTestCase(unittest.IsolatedAsyncioTestCase):
         respx.get(_CANONICAL).mock(
             return_value=httpx.Response(200, json=_REPO_PAYLOAD)
         )
-        plugin = GitHubEnterpriseCloudDoctorPlugin()
+        plugin = GitHubDoctorPlugin()
         # No TPS-slug key in project_links
         results = await plugin.analyze(
             _ctx(links={'github-repository': _DASHBOARD}),
@@ -212,7 +228,7 @@ class AnalyzeTestCase(unittest.IsolatedAsyncioTestCase):
         respx.get(_CANONICAL).mock(
             return_value=httpx.Response(200, json=_REPO_PAYLOAD)
         )
-        plugin = GitHubEnterpriseCloudDoctorPlugin()
+        plugin = GitHubDoctorPlugin()
         results = await plugin.analyze(
             _ctx(
                 links={
@@ -232,7 +248,7 @@ class AnalyzeTestCase(unittest.IsolatedAsyncioTestCase):
         respx.get(_CANONICAL).mock(
             return_value=httpx.Response(200, json=_REPO_PAYLOAD)
         )
-        plugin = GitHubEnterpriseCloudDoctorPlugin()
+        plugin = GitHubDoctorPlugin()
         results = await plugin.analyze(
             _ctx(links={_TPS_SLUG: _DASHBOARD}),
             _CREDS,
@@ -247,7 +263,7 @@ class AnalyzeTestCase(unittest.IsolatedAsyncioTestCase):
         respx.get(_CANONICAL).mock(
             return_value=httpx.Response(200, json=_REPO_PAYLOAD)
         )
-        plugin = GitHubEnterpriseCloudDoctorPlugin()
+        plugin = GitHubDoctorPlugin()
         results = await plugin.analyze(
             _ctx(
                 links={
@@ -267,7 +283,7 @@ class AnalyzeTestCase(unittest.IsolatedAsyncioTestCase):
         respx.get(_CANONICAL).mock(
             return_value=httpx.Response(200, json=_REPO_PAYLOAD)
         )
-        plugin = GitHubEnterpriseCloudDoctorPlugin()
+        plugin = GitHubDoctorPlugin()
         results = await plugin.analyze(_ctx(), _CREDS)
         self.assertEqual(
             _by_slug(results)['github-repository-link-match'].status,
@@ -277,7 +293,7 @@ class AnalyzeTestCase(unittest.IsolatedAsyncioTestCase):
     @respx.mock
     async def test_canonical_fetch_fails_401_no_token(self) -> None:
         respx.get(_CANONICAL).mock(return_value=httpx.Response(401))
-        plugin = GitHubEnterpriseCloudDoctorPlugin()
+        plugin = GitHubDoctorPlugin()
         results = await plugin.analyze(_ctx(), {})
         by = _by_slug(results)
         self.assertEqual(by['canonical-url'].status, 'warn')  # type: ignore[attr-defined]
@@ -288,14 +304,14 @@ class AnalyzeTestCase(unittest.IsolatedAsyncioTestCase):
     @respx.mock
     async def test_canonical_fetch_fails_401_with_token(self) -> None:
         respx.get(_CANONICAL).mock(return_value=httpx.Response(401))
-        plugin = GitHubEnterpriseCloudDoctorPlugin()
+        plugin = GitHubDoctorPlugin()
         results = await plugin.analyze(_ctx(), _CREDS)
         self.assertEqual(_by_slug(results)['canonical-url'].status, 'fail')  # type: ignore[attr-defined]
 
     @respx.mock
     async def test_canonical_fetch_404(self) -> None:
         respx.get(_CANONICAL).mock(return_value=httpx.Response(404))
-        plugin = GitHubEnterpriseCloudDoctorPlugin()
+        plugin = GitHubDoctorPlugin()
         results = await plugin.analyze(_ctx(), _CREDS)
         by = _by_slug(results)
         self.assertEqual(by['canonical-url'].status, 'fail')  # type: ignore[attr-defined]
@@ -304,7 +320,7 @@ class AnalyzeTestCase(unittest.IsolatedAsyncioTestCase):
     @respx.mock
     async def test_transport_error(self) -> None:
         respx.get(_CANONICAL).mock(side_effect=httpx.ConnectError('boom'))
-        plugin = GitHubEnterpriseCloudDoctorPlugin()
+        plugin = GitHubDoctorPlugin()
         results = await plugin.analyze(_ctx(), _CREDS)
         self.assertEqual(_by_slug(results)['canonical-url'].status, 'fail')  # type: ignore[attr-defined]
 
@@ -314,7 +330,7 @@ class AnalyzeTestCase(unittest.IsolatedAsyncioTestCase):
         respx.get(derived_url).mock(
             return_value=httpx.Response(200, json=_REPO_PAYLOAD)
         )
-        plugin = GitHubEnterpriseCloudDoctorPlugin()
+        plugin = GitHubDoctorPlugin()
         results = await plugin.analyze(
             _ctx(
                 connections=[
@@ -339,7 +355,7 @@ class RemediationOfferTestCase(unittest.IsolatedAsyncioTestCase):
         respx.get(_CANONICAL).mock(
             return_value=httpx.Response(200, json={**_REPO_PAYLOAD, 'id': 999})
         )
-        plugin = GitHubEnterpriseCloudDoctorPlugin()
+        plugin = GitHubDoctorPlugin()
         results = await plugin.analyze(_ctx(), _CREDS)
         by = _by_slug(results)
         offer = by['identifier-match'].remediation  # type: ignore[attr-defined]
@@ -351,7 +367,7 @@ class RemediationOfferTestCase(unittest.IsolatedAsyncioTestCase):
         respx.get(_CANONICAL).mock(
             return_value=httpx.Response(200, json=_REPO_PAYLOAD)
         )
-        plugin = GitHubEnterpriseCloudDoctorPlugin()
+        plugin = GitHubDoctorPlugin()
         results = await plugin.analyze(_ctx(), _CREDS)
         for item in results:
             self.assertIsNone(item.remediation)  # type: ignore[attr-defined]
@@ -359,12 +375,12 @@ class RemediationOfferTestCase(unittest.IsolatedAsyncioTestCase):
 
 class RemediateTestCase(unittest.IsolatedAsyncioTestCase):
     async def test_unknown_id_raises(self) -> None:
-        plugin = GitHubEnterpriseCloudDoctorPlugin()
+        plugin = GitHubDoctorPlugin()
         with self.assertRaises(PluginRemediationNotSupported):
             await plugin.remediate(_ctx(), _CREDS, 'bogus')
 
     async def test_no_connection_failed(self) -> None:
-        plugin = GitHubEnterpriseCloudDoctorPlugin()
+        plugin = GitHubDoctorPlugin()
         result = await plugin.remediate(
             _ctx(connections=[]), _CREDS, _REPAIR_EDGE
         )
@@ -375,7 +391,7 @@ class RemediateTestCase(unittest.IsolatedAsyncioTestCase):
         respx.get(_CANONICAL).mock(
             return_value=httpx.Response(200, json={**_REPO_PAYLOAD, 'id': 999})
         )
-        plugin = GitHubEnterpriseCloudDoctorPlugin()
+        plugin = GitHubDoctorPlugin()
         ctx = _ctx(
             connections=[
                 ServiceConnection(
@@ -403,7 +419,7 @@ class RemediateTestCase(unittest.IsolatedAsyncioTestCase):
         respx.get(_CANONICAL).mock(
             return_value=httpx.Response(200, json=_REPO_PAYLOAD)
         )
-        plugin = GitHubEnterpriseCloudDoctorPlugin()
+        plugin = GitHubDoctorPlugin()
         ctx = _ctx()
         result = await plugin.remediate(ctx, _CREDS, _REPAIR_EDGE)
         self.assertEqual(result.status, 'noop')
@@ -414,7 +430,7 @@ class RemediateTestCase(unittest.IsolatedAsyncioTestCase):
         respx.get(_CANONICAL).mock(
             return_value=httpx.Response(200, json=_REPO_PAYLOAD)
         )
-        plugin = GitHubEnterpriseCloudDoctorPlugin()
+        plugin = GitHubDoctorPlugin()
         ctx = _ctx(
             links={
                 _TPS_SLUG: _DASHBOARD,
@@ -432,7 +448,7 @@ class RemediateTestCase(unittest.IsolatedAsyncioTestCase):
         respx.get(_CANONICAL).mock(
             return_value=httpx.Response(200, json=_REPO_PAYLOAD)
         )
-        plugin = GitHubEnterpriseCloudDoctorPlugin()
+        plugin = GitHubDoctorPlugin()
         ctx = _ctx()
         result = await plugin.remediate(ctx, _CREDS, _REPAIR_GITHUB_LINK)
         self.assertEqual(result.status, 'noop')
@@ -441,14 +457,14 @@ class RemediateTestCase(unittest.IsolatedAsyncioTestCase):
     @respx.mock
     async def test_401_propagates_for_identity_retry(self) -> None:
         respx.get(_CANONICAL).mock(return_value=httpx.Response(401))
-        plugin = GitHubEnterpriseCloudDoctorPlugin()
+        plugin = GitHubDoctorPlugin()
         with self.assertRaises(PluginAuthenticationFailed):
             await plugin.remediate(_ctx(), _CREDS, _REPAIR_EDGE)
 
     @respx.mock
     async def test_non_success_failed(self) -> None:
         respx.get(_CANONICAL).mock(return_value=httpx.Response(404))
-        plugin = GitHubEnterpriseCloudDoctorPlugin()
+        plugin = GitHubDoctorPlugin()
         result = await plugin.remediate(_ctx(), _CREDS, _REPAIR_EDGE)
         self.assertEqual(result.status, 'failed')
 

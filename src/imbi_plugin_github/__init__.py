@@ -8,11 +8,7 @@ host from that connection plugin.
 
 from imbi_plugin_github.connection import GitHubConnectionPlugin
 from imbi_plugin_github.deployment import GitHubDeploymentPlugin
-from imbi_plugin_github.doctor import (
-    GitHubDoctorPlugin,
-    GitHubEnterpriseCloudDoctorPlugin,
-    GitHubEnterpriseServerDoctorPlugin,
-)
+from imbi_plugin_github.doctor import GitHubDoctorPlugin
 from imbi_plugin_github.identity import GitHubIdentityPlugin
 from imbi_plugin_github.lifecycle import GitHubLifecyclePlugin
 
@@ -20,8 +16,6 @@ __all__ = [
     'GitHubConnectionPlugin',
     'GitHubDeploymentPlugin',
     'GitHubDoctorPlugin',
-    'GitHubEnterpriseCloudDoctorPlugin',
-    'GitHubEnterpriseServerDoctorPlugin',
     'GitHubIdentityPlugin',
     'GitHubLifecyclePlugin',
 ]
