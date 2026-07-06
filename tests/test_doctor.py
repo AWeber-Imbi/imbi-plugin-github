@@ -5,6 +5,7 @@ import unittest
 import httpx
 import respx
 from imbi_common.plugins.base import (
+    AnalysisResultItem,
     PluginContext,
     ServiceConnection,
     ServicePlugin,
@@ -70,8 +71,10 @@ def _ctx(
     )
 
 
-def _by_slug(items: object) -> dict[str, object]:
-    return {i.slug: i for i in items}  # type: ignore[attr-defined]
+def _by_slug(
+    items: list[AnalysisResultItem],
+) -> dict[str, AnalysisResultItem]:
+    return {i.slug: i for i in items}
 
 
 class ManifestTestCase(unittest.TestCase):
@@ -120,13 +123,13 @@ class AnalyzeTestCase(unittest.IsolatedAsyncioTestCase):
         results = await plugin.analyze(_ctx(), _CREDS)
         by = _by_slug(results)
         self.assertEqual(len(results), 7)
-        self.assertEqual(by['exists-in'].status, 'pass')  # type: ignore[attr-defined]
-        self.assertEqual(by['canonical-url'].status, 'pass')  # type: ignore[attr-defined]
-        self.assertEqual(by['identifier-type'].status, 'pass')  # type: ignore[attr-defined]
-        self.assertEqual(by['identifier-match'].status, 'pass')  # type: ignore[attr-defined]
-        self.assertEqual(by['canonical-url-shape'].status, 'pass')  # type: ignore[attr-defined]
-        self.assertEqual(by['dashboard-url-match'].status, 'pass')  # type: ignore[attr-defined]
-        self.assertEqual(by['github-repository-link-match'].status, 'pass')  # type: ignore[attr-defined]
+        self.assertEqual(by['exists-in'].status, 'pass')
+        self.assertEqual(by['canonical-url'].status, 'pass')
+        self.assertEqual(by['identifier-type'].status, 'pass')
+        self.assertEqual(by['identifier-match'].status, 'pass')
+        self.assertEqual(by['canonical-url-shape'].status, 'pass')
+        self.assertEqual(by['dashboard-url-match'].status, 'pass')
+        self.assertEqual(by['github-repository-link-match'].status, 'pass')
 
     @respx.mock
     async def test_identifier_not_integer(self) -> None:
@@ -146,7 +149,7 @@ class AnalyzeTestCase(unittest.IsolatedAsyncioTestCase):
             ),
             _CREDS,
         )
-        self.assertEqual(_by_slug(results)['identifier-type'].status, 'fail')  # type: ignore[attr-defined]
+        self.assertEqual(_by_slug(results)['identifier-type'].status, 'fail')
 
     @respx.mock
     async def test_identifier_mismatch(self) -> None:
@@ -155,7 +158,7 @@ class AnalyzeTestCase(unittest.IsolatedAsyncioTestCase):
         )
         plugin = GitHubDoctorPlugin()
         results = await plugin.analyze(_ctx(), _CREDS)
-        self.assertEqual(_by_slug(results)['identifier-match'].status, 'fail')  # type: ignore[attr-defined]
+        self.assertEqual(_by_slug(results)['identifier-match'].status, 'fail')
 
     @respx.mock
     async def test_canonical_url_wrong_shape(self) -> None:
@@ -179,14 +182,22 @@ class AnalyzeTestCase(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             _by_slug(results)['canonical-url-shape'].status,
-            'fail',  # type: ignore[attr-defined]
+            'fail',
         )
 
     @respx.mock
     async def test_canonical_url_wrong_host(self) -> None:
-        # Canonical URL points at api.github.com instead of api.aweber.ghe.com
+        # Canonical URL points at api.github.com instead of
+        # api.aweber.ghe.com. The Bearer token must never be sent to that
+        # smuggled host: the fetch is rebuilt through the resolved
+        # api_base (api.aweber.ghe.com) from the trusted repo id, so the
+        # request lands on _CANONICAL. The shape check still fails because
+        # it inspects the raw stored URL.
         wrong_host_canonical = 'https://api.github.com/repositories/134741'
-        respx.get(wrong_host_canonical).mock(
+        github_route = respx.get(wrong_host_canonical).mock(
+            return_value=httpx.Response(200, json=_REPO_PAYLOAD)
+        )
+        respx.get(_CANONICAL).mock(
             return_value=httpx.Response(200, json=_REPO_PAYLOAD)
         )
         plugin = GitHubDoctorPlugin()
@@ -202,9 +213,10 @@ class AnalyzeTestCase(unittest.IsolatedAsyncioTestCase):
             ),
             _CREDS,
         )
+        self.assertFalse(github_route.called)
         self.assertEqual(
             _by_slug(results)['canonical-url-shape'].status,
-            'fail',  # type: ignore[attr-defined]
+            'fail',
         )
 
     @respx.mock
@@ -220,7 +232,7 @@ class AnalyzeTestCase(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             _by_slug(results)['dashboard-url-match'].status,
-            'warn',  # type: ignore[attr-defined]
+            'warn',
         )
 
     @respx.mock
@@ -240,7 +252,7 @@ class AnalyzeTestCase(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             _by_slug(results)['dashboard-url-match'].status,
-            'fail',  # type: ignore[attr-defined]
+            'fail',
         )
 
     @respx.mock
@@ -255,7 +267,7 @@ class AnalyzeTestCase(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             _by_slug(results)['github-repository-link-match'].status,
-            'warn',  # type: ignore[attr-defined]
+            'warn',
         )
 
     @respx.mock
@@ -275,7 +287,7 @@ class AnalyzeTestCase(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             _by_slug(results)['github-repository-link-match'].status,
-            'fail',  # type: ignore[attr-defined]
+            'fail',
         )
 
     @respx.mock
@@ -287,7 +299,7 @@ class AnalyzeTestCase(unittest.IsolatedAsyncioTestCase):
         results = await plugin.analyze(_ctx(), _CREDS)
         self.assertEqual(
             _by_slug(results)['github-repository-link-match'].status,
-            'pass',  # type: ignore[attr-defined]
+            'pass',
         )
 
     @respx.mock
@@ -296,17 +308,17 @@ class AnalyzeTestCase(unittest.IsolatedAsyncioTestCase):
         plugin = GitHubDoctorPlugin()
         results = await plugin.analyze(_ctx(), {})
         by = _by_slug(results)
-        self.assertEqual(by['canonical-url'].status, 'warn')  # type: ignore[attr-defined]
+        self.assertEqual(by['canonical-url'].status, 'warn')
         # Body-dependent checks should all be warn when fetch fails
-        self.assertEqual(by['identifier-type'].status, 'warn')  # type: ignore[attr-defined]
-        self.assertEqual(by['identifier-match'].status, 'warn')  # type: ignore[attr-defined]
+        self.assertEqual(by['identifier-type'].status, 'warn')
+        self.assertEqual(by['identifier-match'].status, 'warn')
 
     @respx.mock
     async def test_canonical_fetch_fails_401_with_token(self) -> None:
         respx.get(_CANONICAL).mock(return_value=httpx.Response(401))
         plugin = GitHubDoctorPlugin()
         results = await plugin.analyze(_ctx(), _CREDS)
-        self.assertEqual(_by_slug(results)['canonical-url'].status, 'fail')  # type: ignore[attr-defined]
+        self.assertEqual(_by_slug(results)['canonical-url'].status, 'fail')
 
     @respx.mock
     async def test_canonical_fetch_404(self) -> None:
@@ -314,15 +326,15 @@ class AnalyzeTestCase(unittest.IsolatedAsyncioTestCase):
         plugin = GitHubDoctorPlugin()
         results = await plugin.analyze(_ctx(), _CREDS)
         by = _by_slug(results)
-        self.assertEqual(by['canonical-url'].status, 'fail')  # type: ignore[attr-defined]
-        self.assertEqual(by['identifier-match'].status, 'warn')  # type: ignore[attr-defined]
+        self.assertEqual(by['canonical-url'].status, 'fail')
+        self.assertEqual(by['identifier-match'].status, 'warn')
 
     @respx.mock
     async def test_transport_error(self) -> None:
         respx.get(_CANONICAL).mock(side_effect=httpx.ConnectError('boom'))
         plugin = GitHubDoctorPlugin()
         results = await plugin.analyze(_ctx(), _CREDS)
-        self.assertEqual(_by_slug(results)['canonical-url'].status, 'fail')  # type: ignore[attr-defined]
+        self.assertEqual(_by_slug(results)['canonical-url'].status, 'fail')
 
     @respx.mock
     async def test_derives_url_from_links_when_no_canonical_url(self) -> None:
@@ -344,9 +356,32 @@ class AnalyzeTestCase(unittest.IsolatedAsyncioTestCase):
             _CREDS,
         )
         by = _by_slug(results)
-        self.assertEqual(by['canonical-url'].status, 'pass')  # type: ignore[attr-defined]
+        self.assertEqual(by['canonical-url'].status, 'pass')
         # No canonical URL on the edge → shape check should warn
-        self.assertEqual(by['canonical-url-shape'].status, 'warn')  # type: ignore[attr-defined]
+        self.assertEqual(by['canonical-url-shape'].status, 'warn')
+
+    @respx.mock
+    async def test_token_fallback_credential(self) -> None:
+        # The 'token' key is the documented fallback for 'access_token'.
+        respx.get(_CANONICAL).mock(
+            return_value=httpx.Response(200, json=_REPO_PAYLOAD)
+        )
+        plugin = GitHubDoctorPlugin()
+        results = await plugin.analyze(_ctx(), {'token': 'gho_fallback'})
+        self.assertEqual(_by_slug(results)['canonical-url'].status, 'pass')
+
+    @respx.mock
+    async def test_non_object_body_fails(self) -> None:
+        # A 2xx with a malformed / non-object body must not raise; it is
+        # reported as a failed canonical-url check.
+        respx.get(_CANONICAL).mock(
+            return_value=httpx.Response(200, text='not json')
+        )
+        plugin = GitHubDoctorPlugin()
+        results = await plugin.analyze(_ctx(), _CREDS)
+        by = _by_slug(results)
+        self.assertEqual(by['canonical-url'].status, 'fail')
+        self.assertEqual(by['identifier-match'].status, 'warn')
 
 
 class RemediationOfferTestCase(unittest.IsolatedAsyncioTestCase):
@@ -358,7 +393,7 @@ class RemediationOfferTestCase(unittest.IsolatedAsyncioTestCase):
         plugin = GitHubDoctorPlugin()
         results = await plugin.analyze(_ctx(), _CREDS)
         by = _by_slug(results)
-        offer = by['identifier-match'].remediation  # type: ignore[attr-defined]
+        offer = by['identifier-match'].remediation
         self.assertIsNotNone(offer)
         self.assertEqual(offer.id, _REPAIR_EDGE)
 
@@ -370,7 +405,7 @@ class RemediationOfferTestCase(unittest.IsolatedAsyncioTestCase):
         plugin = GitHubDoctorPlugin()
         results = await plugin.analyze(_ctx(), _CREDS)
         for item in results:
-            self.assertIsNone(item.remediation)  # type: ignore[attr-defined]
+            self.assertIsNone(item.remediation)
 
 
 class RemediateTestCase(unittest.IsolatedAsyncioTestCase):
@@ -464,6 +499,36 @@ class RemediateTestCase(unittest.IsolatedAsyncioTestCase):
     @respx.mock
     async def test_non_success_failed(self) -> None:
         respx.get(_CANONICAL).mock(return_value=httpx.Response(404))
+        plugin = GitHubDoctorPlugin()
+        result = await plugin.remediate(_ctx(), _CREDS, _REPAIR_EDGE)
+        self.assertEqual(result.status, 'failed')
+
+    @respx.mock
+    async def test_token_fallback_credential(self) -> None:
+        # The 'token' key is the documented fallback for 'access_token'.
+        respx.get(_CANONICAL).mock(
+            return_value=httpx.Response(200, json=_REPO_PAYLOAD)
+        )
+        plugin = GitHubDoctorPlugin()
+        result = await plugin.remediate(
+            _ctx(), {'token': 'gho_fallback'}, _REPAIR_EDGE
+        )
+        self.assertEqual(result.status, 'noop')
+
+    @respx.mock
+    async def test_non_object_body_failed(self) -> None:
+        respx.get(_CANONICAL).mock(
+            return_value=httpx.Response(200, json=[1, 2, 3])
+        )
+        plugin = GitHubDoctorPlugin()
+        result = await plugin.remediate(_ctx(), _CREDS, _REPAIR_EDGE)
+        self.assertEqual(result.status, 'failed')
+
+    @respx.mock
+    async def test_missing_html_url_failed(self) -> None:
+        respx.get(_CANONICAL).mock(
+            return_value=httpx.Response(200, json={'id': 134741})
+        )
         plugin = GitHubDoctorPlugin()
         result = await plugin.remediate(_ctx(), _CREDS, _REPAIR_EDGE)
         self.assertEqual(result.status, 'failed')

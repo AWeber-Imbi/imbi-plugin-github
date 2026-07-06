@@ -68,6 +68,22 @@ async def _raise_on_401(response: httpx.Response) -> None:
     )
 
 
+def _json_object(resp: httpx.Response) -> dict[str, typing.Any] | None:
+    """Return the response body when it is a JSON object, else ``None``.
+
+    A 2xx response with a malformed or non-object payload should not
+    raise from ``resp.json()`` / ``.get()``; callers turn ``None`` into a
+    clear diagnostic (analyze) or remediation failure.
+    """
+    try:
+        payload = resp.json()
+    except ValueError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return typing.cast(dict[str, typing.Any], payload)
+
+
 def _item(
     slug: str,
     title: str,
@@ -95,9 +111,17 @@ def _repo_fetch_url(
     Prefer the rename-stable canonical URL on the ``EXISTS_IN`` edge;
     otherwise derive ``(owner, repo)`` from the project links. Returns
     ``None`` when neither is available.
+
+    The stored canonical URL is never fetched verbatim: only the numeric
+    repository id is trusted from it, and the request URL is rebuilt
+    through the resolved ``api_base`` (the routing single source of
+    truth). This keeps the Bearer token from ever being sent to an
+    arbitrary host smuggled onto the ``EXISTS_IN`` edge.
     """
     if connection.canonical_url:
-        return connection.canonical_url
+        match = _REPO_ID_RE.fullmatch(connection.canonical_url)
+        if match is not None:
+            return f'{api_base}/repositories/{match.group(1)}'
     derived = derive_owner_repo_from_links(
         ctx.project_links,
         host,
@@ -208,7 +232,6 @@ class GitHubDoctorPlugin(AnalysisPlugin):
             return results
 
         # Step 4: fetch the repo.
-        body: dict[str, typing.Any] | None = None
         try:
             async with httpx.AsyncClient(
                 headers=headers,
@@ -277,6 +300,20 @@ class GitHubDoctorPlugin(AnalysisPlugin):
             results.extend(_body_unavailable_items())
             return results
 
+        body = _json_object(resp)
+        if body is None:
+            results.append(
+                _item(
+                    'canonical-url',
+                    'Canonical URL',
+                    'fail',
+                    f'GitHub returned an unexpected (non-object) body '
+                    f'from {fetch_url!r}.',
+                )
+            )
+            results.extend(_body_unavailable_items())
+            return results
+
         results.append(
             _item(
                 'canonical-url',
@@ -285,7 +322,6 @@ class GitHubDoctorPlugin(AnalysisPlugin):
                 f'Fetched {fetch_url!r} — HTTP {resp.status_code}.',
             )
         )
-        body = typing.cast(dict[str, typing.Any], resp.json())
 
         # Step 5: body-dependent checks.
 
@@ -551,13 +587,26 @@ class GitHubDoctorPlugin(AnalysisPlugin):
                 message=f'HTTP {resp.status_code} fetching {fetch_url!r}.',
             )
 
-        body = typing.cast(dict[str, typing.Any], resp.json())
+        body = _json_object(resp)
+        if body is None:
+            return RemediationResult(
+                status='failed',
+                message=(
+                    f'GitHub returned an unexpected (non-object) body '
+                    f'from {fetch_url!r}.'
+                ),
+            )
         api_id = body.get('id')
-        html_url = str(body.get('html_url', ''))
+        html_url = body.get('html_url')
         if not isinstance(api_id, int):
             return RemediationResult(
                 status='failed',
                 message='GitHub response did not include an integer id.',
+            )
+        if not isinstance(html_url, str) or not html_url:
+            return RemediationResult(
+                status='failed',
+                message='GitHub response did not include an html_url.',
             )
 
         if remediation_id == _REPAIR_GITHUB_LINK:
