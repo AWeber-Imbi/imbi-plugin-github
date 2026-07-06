@@ -123,15 +123,6 @@ default-groups = ["dev"]
 exclude-newer = "7 days"
 exclude-newer-package = { "clickhouse-connect" = false, "imbi-common" = false, "imbi-plugin-aws" = false, "imbi-plugin-github" = false, "imbi-plugin-logzio" = false, "imbi-plugin-oidc" = false, "imbi-plugin-pagerduty" = false, "imbi-plugin-sentry" = false, "imbi-plugin-sonarqube" = false }
 
-[tool.uv.sources]
-# TEMP (doctor-remediation): consume the local imbi-common work tree
-# (feature/doctor-remediation = main + the remediation contract) until
-# imbi-common publishes a release carrying BOTH the plugin-consolidation
-# ConnectionPlugin type and the remediation contract. Restore the pinned
-# PyPI version (==X) and remove this block before the PR. imbi-common is
-# a public repo, so CI clones it anonymously (no token needed).
-imbi-common = { path = "../imbi-common", editable = true }
-
 [[tool.uv.index]]
 url = "https://pypi.org/simple"
 default = true
